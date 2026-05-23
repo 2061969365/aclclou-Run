@@ -17,103 +17,85 @@ jobs:
       # ────────────────────────────────────────────
       - name: Install Xray
         run: |
-          # 下载 Xray-core 最新版
-          XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep tag_name | cut -d '"' -f 4)
+          XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest \
+            | grep '"tag_name"' | head -1 | cut -d '"' -f 4)
           echo "Xray version: $XRAY_VERSION"
           wget -q "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -O xray.zip
           unzip -q xray.zip -d xray-bin
           chmod +x xray-bin/xray
           sudo mv xray-bin/xray /usr/local/bin/xray
+          xray version
 
-      - name: Configure Xray (VLESS → Socks5:1080)
+      - name: Configure and start Xray (VLESS → Socks5:1080)
         run: |
-          # 从 VLESS URL 解析参数
-          # vless://3f34622f-1199-4f2a-8c6b-72893ce3527e@shopify.com:2083?...#US|-shopify.com
-          cat > /tmp/xray-config.json << 'EOF'
-          {
-            "log": { "loglevel": "warning" },
-            "inbounds": [
-              {
-                "listen": "127.0.0.1",
-                "port": 1080,
-                "protocol": "socks",
-                "settings": {
-                  "auth": "noauth",
-                  "udp": true
-                },
-                "tag": "socks-in"
-              }
-            ],
-            "outbounds": [
-              {
-                "protocol": "vless",
-                "settings": {
-                  "vnext": [
-                    {
-                      "address": "shopify.com",
-                      "port": 2083,
-                      "users": [
-                        {
-                          "id": "3f34622f-1199-4f2a-8c6b-72893ce3527e",
-                          "encryption": "none"
-                        }
-                      ]
-                    }
-                  ]
-                },
-                "streamSettings": {
-                  "network": "ws",
-                  "security": "tls",
-                  "tlsSettings": {
-                    "serverName": "20.fnos9527.de5.net",
-                    "allowInsecure": true
-                  },
-                  "wsSettings": {
-                    "path": "/",
-                    "headers": {
-                      "Host": "20.fnos9527.de5.net"
-                    }
-                  }
-                },
-                "tag": "vless-out"
-              },
-              {
-                "protocol": "freedom",
-                "tag": "direct"
-              }
-            ],
-            "routing": {
-              "rules": [
-                {
-                  "type": "field",
-                  "inboundTag": ["socks-in"],
-                  "outboundTag": "vless-out"
-                }
-              ]
-            }
-          }
-          EOF
+          # 注意：用 python3 生成 JSON 避免 heredoc 缩进问题
+          python3 - << 'PYEOF'
+import json, pathlib
+cfg = {
+  "log": {"loglevel": "warning"},
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": 1080,
+    "protocol": "socks",
+    "settings": {"auth": "noauth", "udp": True},
+    "tag": "socks-in"
+  }],
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [{
+          "address": "shopify.com",
+          "port": 2083,
+          "users": [{"id": "3f34622f-1199-4f2a-8c6b-72893ce3527e", "encryption": "none"}]
+        }]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "20.fnos9527.de5.net",
+          "allowInsecure": True
+        },
+        "wsSettings": {
+          "path": "/",
+          "headers": {"Host": "20.fnos9527.de5.net"}
+        }
+      },
+      "tag": "vless-out"
+    },
+    {"protocol": "freedom", "tag": "direct"}
+  ],
+  "routing": {
+    "rules": [{"type": "field", "inboundTag": ["socks-in"], "outboundTag": "vless-out"}]
+  }
+}
+pathlib.Path('/tmp/xray-config.json').write_text(json.dumps(cfg, indent=2))
+print("xray-config.json written OK")
+PYEOF
 
-      - name: Start Xray proxy
-        run: |
-          xray -config /tmp/xray-config.json &
-          XRAY_PID=$!
-          echo "XRAY_PID=$XRAY_PID" >> $GITHUB_ENV
-          # 等待 Socks5 端口就绪（最多 10 秒）
-          for i in $(seq 1 10); do
+          # 启动 Xray 后台进程
+          xray -config /tmp/xray-config.json > /tmp/xray.log 2>&1 &
+          echo $! > /tmp/xray.pid
+
+          # 等待 Socks5 端口就绪（最多 15 秒）
+          for i in $(seq 1 15); do
             if nc -z 127.0.0.1 1080 2>/dev/null; then
-              echo "✅ Xray Socks5 proxy is ready on 127.0.0.1:1080"
+              echo "✅ Xray Socks5 ready on 127.0.0.1:1080"
               break
             fi
-            echo "等待 Xray 启动... ($i/10)"
+            echo "Waiting for Xray... ($i/15)"
             sleep 1
           done
-          # 验证代理可用（访问 IP 检测，超时 10s）
-          PROXY_IP=$(curl -s --socks5 127.0.0.1:1080 --max-time 10 https://api.ipify.org || echo "proxy_check_failed")
+
+          # 验证代理出口 IP
+          PROXY_IP=$(curl -s --socks5 127.0.0.1:1080 --max-time 15 https://api.ipify.org \
+            || echo "proxy_check_failed")
           echo "出口 IP: $PROXY_IP"
 
       # ────────────────────────────────────────────
       # 2. 安装 Node.js 依赖 + Playwright
+      #    关键：在 GITHUB_WORKSPACE 下安装，脚本也放在同一目录
       # ────────────────────────────────────────────
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -122,219 +104,199 @@ jobs:
 
       - name: Install Playwright
         run: |
+          # 初始化 package.json（避免警告），然后安装 playwright
+          npm init -y
           npm install playwright
           npx playwright install chromium --with-deps
 
       # ────────────────────────────────────────────
-      # 3. 运行续期脚本
+      # 3. 写出续期脚本（放到 GITHUB_WORKSPACE，能找到 node_modules）
+      # ────────────────────────────────────────────
+      - name: Write renewal script
+        run: |
+          # 注意：脚本写到当前工作目录（$GITHUB_WORKSPACE），
+          # 而不是 /tmp/，这样 Node ESM 才能解析 playwright
+          cat > renew.mjs << 'JSEOF'
+import { chromium } from 'playwright';
+
+const EMAIL     = process.env.ACL_EMAIL;
+const PASSWORD  = process.env.ACL_PASSWORD;
+const SERVER_ID = process.env.ACL_SERVER_ID;
+const TG_TOKEN  = process.env.TG_BOT_TOKEN;
+const TG_CHAT   = process.env.TG_CHAT_ID;
+const PROXY_SRV = 'socks5://127.0.0.1:1080';
+
+async function tgNotify(msg) {
+  if (!TG_TOKEN || !TG_CHAT) { console.log('[TG] 未配置，跳过'); return; }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT, text: msg, parse_mode: 'HTML' }),
+    });
+    const d = await res.json();
+    console.log(d.ok ? '[TG] 已发送' : `[TG] 失败: ${d.description}`);
+  } catch (e) { console.error('[TG] 异常:', e.message); }
+}
+
+// 解析 "2j 15h 48min" → 总小时数
+function parseHours(text) {
+  const t = text || '';
+  const d = parseInt(t.match(/(\d+)\s*j/)?.[1]   || '0', 10);
+  const h = parseInt(t.match(/(\d+)\s*h/)?.[1]   || '0', 10);
+  const m = parseInt(t.match(/(\d+)\s*min/)?.[1] || '0', 10);
+  return d * 24 + h + m / 60;
+}
+
+// 从页面文本块中提取时间字符串
+async function getRemainText(page) {
+  const raw = await page.locator('text=Temps restant').first().textContent();
+  const m = raw.match(/\d+\s*j\s*\d+\s*h\s*\d+\s*min/);
+  return { raw, time: m ? m[0] : raw };
+}
+
+(async () => {
+  console.log(`[代理] ${PROXY_SRV}`);
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      proxy: { server: PROXY_SRV },
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage',
+      ],
+    });
+
+    const ctx = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 800 },
+      locale: 'zh-CN',
+    });
+
+    const page = await ctx.newPage();
+    page.setDefaultTimeout(30000);
+
+    // ── 1. 登录 ──
+    console.log('[1/5] 打开登录页...');
+    await page.goto('https://dash.aclclouds.com/auth/login', {
+      waitUntil: 'domcontentloaded', timeout: 30000,
+    });
+
+    console.log('[2/5] 填写邮箱...');
+    await page.waitForSelector('input[type="email"]', { timeout: 15000 });
+    await page.locator('input[type="email"]').first().fill(EMAIL);
+
+    console.log('[3/5] 填写密码...');
+    await page.locator('input[type="password"]').first().fill(PASSWORD);
+
+    console.log('[4/5] 勾选人机验证...');
+    const cb = page.locator('input[type="checkbox"]').first();
+    await cb.waitFor({ state: 'visible', timeout: 10000 });
+    await cb.click();
+    await page.waitForTimeout(800);
+
+    console.log('[5/5] 点击登录...');
+    await page.locator('button:has-text("Sign in"), button[type="submit"]').first().click();
+    await page.waitForURL(/dash\.aclclouds\.com\/(?!auth)/, { timeout: 20000 });
+    console.log('[✓] 登录成功:', page.url());
+
+    // ── 2. 访问服务器控制台 ──
+    const serverUrl = `https://dash.aclclouds.com/server/${SERVER_ID}`;
+    console.log(`[→] 跳转到: ${serverUrl}`);
+    await page.goto(serverUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.waitForSelector('text=Temps restant', { timeout: 15000 });
+
+    const { raw, time: remainText } = await getRemainText(page);
+    console.log(`[时间] 原始块: ${raw}`);
+    console.log(`[时间] 解析: ${remainText}`);
+
+    const remainHours = parseHours(remainText);
+    console.log(`[时间] 剩余 ${(remainHours / 24).toFixed(2)} 天 (${remainHours.toFixed(1)} 小时)`);
+
+    // ── 3. 判断是否续期 ──
+    if (remainHours <= 24) {
+      console.log('[续期] 剩余 ≤ 1 天，开始续期...');
+
+      const renewBtn = page.locator('button:has-text("Renouveler"), a:has-text("Renouveler")').first();
+      await renewBtn.waitFor({ state: 'visible', timeout: 10000 });
+      await renewBtn.click();
+
+      // 等待页面更新
+      await page.waitForTimeout(4000);
+      await page.waitForSelector('text=Temps restant', { timeout: 15000 });
+
+      const { time: newRemainText } = await getRemainText(page);
+      const newHours = parseHours(newRemainText);
+      const newDays  = Math.floor(newHours / 24);
+      const newHrs   = Math.floor(newHours % 24);
+      console.log(`[续期后] 新剩余: ${newRemainText}`);
+
+      await tgNotify(
+        `✅ <b>ACLClouds 续期成功</b>\n\n` +
+        `🖥 服务器: <code>${SERVER_ID}</code>\n` +
+        `⏰ 续期前: ${remainText.trim()}\n` +
+        `🎉 续期后: <b>${newDays} 天 ${newHrs} 小时</b>\n\n` +
+        `🕐 ${new Date().toISOString()}`
+      );
+    } else {
+      const d = Math.floor(remainHours / 24);
+      const h = Math.floor(remainHours % 24);
+      console.log(`[跳过] 剩余 ${d} 天 ${h} 小时，无需续期`);
+
+      await tgNotify(
+        `ℹ️ <b>ACLClouds 无需续期</b>\n\n` +
+        `🖥 服务器: <code>${SERVER_ID}</code>\n` +
+        `⏰ 当前剩余: <b>${d} 天 ${h} 小时</b>（> 1 天，跳过）\n\n` +
+        `🕐 ${new Date().toISOString()}`
+      );
+    }
+
+  } catch (err) {
+    console.error('[错误]', err.message);
+    if (browser) {
+      try {
+        const pg = browser.contexts()[0]?.pages()?.[0];
+        if (pg) await pg.screenshot({ path: 'error-screenshot.png', fullPage: true });
+      } catch (_) {}
+    }
+    await tgNotify(
+      `❌ <b>ACLClouds 续期失败</b>\n\n` +
+      `🖥 服务器: <code>${SERVER_ID || '未设置'}</code>\n` +
+      `💥 ${err.message}\n\n` +
+      `🕐 ${new Date().toISOString()}`
+    );
+    process.exit(1);
+  } finally {
+    if (browser) await browser.close();
+  }
+})();
+JSEOF
+
+      # 确认文件在工作目录
+      ls -la renew.mjs
+
+      # ────────────────────────────────────────────
+      # 4. 运行脚本（在 GITHUB_WORKSPACE，能找到 node_modules）
       # ────────────────────────────────────────────
       - name: Run renewal script
         env:
-          ACL_EMAIL:    ${{ secrets.ACL_EMAIL }}
-          ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
+          ACL_EMAIL:     ${{ secrets.ACL_EMAIL }}
+          ACL_PASSWORD:  ${{ secrets.ACL_PASSWORD }}
           ACL_SERVER_ID: ${{ secrets.ACL_SERVER_ID }}
           TG_BOT_TOKEN:  ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:    ${{ secrets.TG_CHAT_ID }}
-          PROXY_URL:     "socks5://127.0.0.1:1080"
-        run: |
-          cat > /tmp/renew.mjs << 'JSEOF'
-          import { chromium } from 'playwright';
-
-          // ── 读取环境变量 ──
-          const EMAIL      = process.env.ACL_EMAIL;
-          const PASSWORD   = process.env.ACL_PASSWORD;
-          const SERVER_ID  = process.env.ACL_SERVER_ID;   // 如：45686445
-          const TG_TOKEN   = process.env.TG_BOT_TOKEN;
-          const TG_CHAT    = process.env.TG_CHAT_ID;
-          const PROXY_URL  = process.env.PROXY_URL || 'socks5://127.0.0.1:1080';
-
-          // ── 解析 socks5://host:port ──
-          const proxyMatch = PROXY_URL.match(/socks5:\/\/([^:]+):(\d+)/);
-          const proxyServer = proxyMatch
-            ? `socks5://${proxyMatch[1]}:${proxyMatch[2]}`
-            : 'socks5://127.0.0.1:1080';
-
-          // ── Telegram 通知 ──
-          async function tgNotify(msg) {
-            if (!TG_TOKEN || !TG_CHAT) { console.log('[TG跳过] 未配置 Token/ChatID'); return; }
-            const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
-            try {
-              const res = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: TG_CHAT, text: msg, parse_mode: 'HTML' }),
-              });
-              const data = await res.json();
-              if (data.ok) console.log('[TG] 通知已发送');
-              else console.error('[TG] 发送失败:', data.description);
-            } catch (e) {
-              console.error('[TG] 请求异常:', e.message);
-            }
-          }
-
-          // ── 解析剩余时间 → 返回总小时数 ──
-          // 格式示例: "2j 15h 48min"  /  "0j 23h 5min"  /  "1j 0h 30min"
-          function parseRemainingHours(text) {
-            const t = text || '';
-            const days  = parseInt(t.match(/(\d+)\s*j/)?.[1]  || '0', 10);
-            const hours = parseInt(t.match(/(\d+)\s*h/)?.[1]  || '0', 10);
-            const mins  = parseInt(t.match(/(\d+)\s*min/)?.[1]|| '0', 10);
-            return days * 24 + hours + mins / 60;
-          }
-
-          // ── 主流程 ──
-          (async () => {
-            console.log(`[代理] 使用: ${proxyServer}`);
-
-            let browser;
-            try {
-              browser = await chromium.launch({
-                headless: true,
-                proxy: { server: proxyServer },
-                args: [
-                  '--no-sandbox',
-                  '--disable-setuid-sandbox',
-                  '--disable-blink-features=AutomationControlled',
-                  '--disable-dev-shm-usage',
-                ],
-              });
-
-              const context = await browser.newContext({
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                viewport: { width: 1280, height: 800 },
-                locale: 'zh-CN',
-              });
-
-              const page = await context.newPage();
-              page.setDefaultTimeout(30000);
-
-              // ── STEP 1: 打开登录页 ──
-              console.log('[1/5] 打开登录页...');
-              await page.goto('https://dash.aclclouds.com/auth/login', {
-                waitUntil: 'domcontentloaded',
-                timeout: 30000,
-              });
-
-              // ── STEP 2: 填写邮箱 ──
-              console.log('[2/5] 填写邮箱...');
-              await page.waitForSelector('input[type="email"], input[name="email"], input[placeholder*="Email"], input[placeholder*="email"]', { timeout: 15000 });
-              const emailInput = page.locator('input[type="email"], input[name="email"]').first();
-              await emailInput.click();
-              await emailInput.fill(EMAIL);
-
-              // ── STEP 3: 填写密码 ──
-              console.log('[3/5] 填写密码...');
-              const pwInput = page.locator('input[type="password"]').first();
-              await pwInput.click();
-              await pwInput.fill(PASSWORD);
-
-              // ── STEP 4: 点击 "Je ne suis pas un robot" (checkbox) ──
-              console.log('[4/5] 点击人机验证...');
-              // 该验证是普通 checkbox，非 Google reCAPTCHA
-              const robotCheckbox = page.locator('input[type="checkbox"]').first();
-              await robotCheckbox.waitFor({ state: 'visible', timeout: 10000 });
-              await robotCheckbox.click();
-              await page.waitForTimeout(800); // 等待勾选动画
-
-              // ── STEP 5: 点击 Sign in ──
-              console.log('[5/5] 点击登录...');
-              const signInBtn = page.locator('button:has-text("Sign in"), button[type="submit"]').first();
-              await signInBtn.click();
-
-              // 等待跳转（登录成功后会跳转到 dashboard）
-              await page.waitForURL(/dash\.aclclouds\.com\/(?!auth)/, { timeout: 20000 });
-              console.log('[✓] 登录成功，当前URL:', page.url());
-
-              // ── 访问服务器控制台页面 ──
-              const serverUrl = `https://dash.aclclouds.com/server/${SERVER_ID}`;
-              console.log(`[→] 访问服务器页面: ${serverUrl}`);
-              await page.goto(serverUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-              // 等待 "Temps restant" 出现
-              await page.waitForSelector('text=Temps restant', { timeout: 15000 });
-              // 获取包含 "Temps restant" 的父容器文字，再用正则提取时间部分
-              const rawBlock = await page.locator('text=Temps restant').first().textContent();
-              // 提取形如 "2j 15h 48min" 的时间字符串
-              const timeMatch = rawBlock.match(/\d+\s*j\s*\d+\s*h\s*\d+\s*min/);
-              const remainText = timeMatch ? timeMatch[0] : rawBlock;
-              console.log(`[时间] 原始文本: ${rawBlock}`);
-              console.log(`[时间] 解析到: ${remainText}`);
-
-              // 解析剩余时间
-              const remainHours = parseRemainingHours(remainText);
-              const remainDays  = (remainHours / 24).toFixed(2);
-              console.log(`[时间] 剩余约 ${remainDays} 天 (${remainHours.toFixed(1)} 小时)`);
-
-              // ── 判断是否需要续期（剩余 ≤ 1 天 = 24小时）──
-              if (remainHours <= 24) {
-                console.log('[续期] 剩余时间 ≤ 1 天，开始续期...');
-
-                // 点击 Renouveler 按钮
-                const renewBtn = page.locator('button:has-text("Renouveler"), a:has-text("Renouveler")').first();
-                await renewBtn.waitFor({ state: 'visible', timeout: 10000 });
-                await renewBtn.click();
-
-                // 等待续期结果（页面刷新或提示更新）
-                await page.waitForTimeout(3000);
-                await page.waitForSelector('text=Temps restant', { timeout: 15000 });
-                const newRawBlock = await page.locator('text=Temps restant').first().textContent();
-                const newTimeMatch = newRawBlock.match(/\d+\s*j\s*\d+\s*h\s*\d+\s*min/);
-                const newRemainText = newTimeMatch ? newTimeMatch[0] : newRawBlock;
-                const newRemainHours = parseRemainingHours(newRemainText);
-                const newRemainDays  = Math.floor(newRemainHours / 24);
-                console.log(`[续期后] 新剩余时间: ${newRemainText}`);
-
-                const msg = `✅ <b>ACLClouds 续期成功</b>\n\n` +
-                            `🖥 服务器 ID: <code>${SERVER_ID}</code>\n` +
-                            `⏰ 续期前剩余: ${remainText.trim()}\n` +
-                            `🎉 续期后剩余: <b>${newRemainDays} 天 ${Math.floor(newRemainHours % 24)} 小时</b>\n\n` +
-                            `🕐 执行时间: ${new Date().toISOString()}`;
-                await tgNotify(msg);
-                console.log('[✓] 续期完成，通知已发送');
-              } else {
-                const d = Math.floor(remainHours / 24);
-                const h = Math.floor(remainHours % 24);
-                console.log(`[跳过] 剩余 ${d} 天 ${h} 小时，无需续期`);
-
-                const msg = `ℹ️ <b>ACLClouds 无需续期</b>\n\n` +
-                            `🖥 服务器 ID: <code>${SERVER_ID}</code>\n` +
-                            `⏰ 当前剩余: <b>${d} 天 ${h} 小时</b>（大于 1 天，跳过续期）\n\n` +
-                            `🕐 检查时间: ${new Date().toISOString()}`;
-                await tgNotify(msg);
-              }
-
-            } catch (err) {
-              console.error('[错误]', err.message);
-              // 截图存档（调试用）
-              if (browser) {
-                try {
-                  const pages = browser.contexts()[0]?.pages() || [];
-                  if (pages[0]) {
-                    await pages[0].screenshot({ path: '/tmp/error-screenshot.png', fullPage: true });
-                    console.log('[调试] 错误截图已保存到 /tmp/error-screenshot.png');
-                  }
-                } catch (_) {}
-              }
-              await tgNotify(`❌ <b>ACLClouds 续期失败</b>\n\n` +
-                             `🖥 服务器 ID: <code>${SERVER_ID || '未设置'}</code>\n` +
-                             `💥 错误: ${err.message}\n\n` +
-                             `🕐 时间: ${new Date().toISOString()}`);
-              process.exit(1);
-            } finally {
-              if (browser) await browser.close();
-            }
-          })();
-          JSEOF
-
-          node /tmp/renew.mjs
+        run: node renew.mjs
 
       # ────────────────────────────────────────────
-      # 4. 上传截图（仅在失败时）
+      # 5. 失败时上传截图
       # ────────────────────────────────────────────
       - name: Upload error screenshot
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: error-screenshot
-          path: /tmp/error-screenshot.png
+          path: error-screenshot.png
           retention-days: 7
