@@ -8,6 +8,9 @@ const TG_CHAT   = process.env.TG_CHAT_ID;
 const PROXY_SRV = 'socks5://127.0.0.1:1080';
 const BASE_URL  = 'https://dash.aclclouds.com';
 
+// 续期阈值(小时)：剩余时间 <= 此值才续期，> 此值则跳过
+const RENEW_THRESHOLD_HOURS = 48; // 2 天
+
 async function tgNotify(msg) {
   if (!TG_TOKEN || !TG_CHAT) { console.log('[TG] 未配置，跳过'); return; }
   try {
@@ -66,6 +69,88 @@ async function findTimeText(page) {
   });
 }
 
+// 读取顶部电源状态徽章文字（精确匹配 "Offline" / "Online" 等，
+// 与右侧 "STATUS / UPTIME" 面板里的大写 "OFFLINE" 区分开）
+async function findPowerStatus(page) {
+  return await page.evaluate(() => {
+    const knownStates = ['Offline', 'Online', 'Running', 'Starting', 'Stopping', 'Restarting'];
+    const allEls = Array.from(document.querySelectorAll('span, div, p, button'));
+    for (const el of allEls) {
+      if (el.children.length > 0) continue; // 只看纯文本叶子节点
+      const text = (el.textContent || '').trim();
+      if (knownStates.includes(text)) {
+        return text;
+      }
+    }
+    return null;
+  });
+}
+
+// 检测到 Offline 时点击 Start 按钮
+async function clickStartButton(page) {
+  return await page.evaluate(() => {
+    const btn = document.querySelector('button.power-btn[data-variant="start"]');
+    if (btn) {
+      btn.click();
+      return true;
+    }
+    // 兜底：按文字找
+    const buttons = Array.from(document.querySelectorAll('button'));
+    const fallback = buttons.find(b => (b.textContent || '').trim() === 'Start');
+    if (fallback) {
+      fallback.click();
+      return true;
+    }
+    return false;
+  });
+}
+
+// 检查容器电源状态，如果是 Offline 则点击开机，并发送通知
+async function checkAndStartServer(page) {
+  console.log('[开机检测] 读取当前电源状态...');
+  const status = await findPowerStatus(page);
+  console.log('[开机检测] 当前状态:', status);
+
+  if (status !== 'Offline') {
+    console.log('[开机检测] 状态不是 Offline，跳过开机操作');
+    return;
+  }
+
+  console.log('[开机检测] 检测到 Offline，点击 Start 按钮...');
+  const clicked = await clickStartButton(page);
+  if (!clicked) {
+    console.log('[开机检测] 未找到 Start 按钮，放弃开机');
+    await tgNotify(
+      'ACLClouds 开机失败\n\n' +
+      '服务器: ' + SERVER_ID + '\n' +
+      '原因: 未找到 Start 按钮\n\n' +
+      '时间: ' + new Date().toISOString()
+    );
+    return;
+  }
+
+  // 等待 2~3 秒后再检查状态
+  await page.waitForTimeout(randInt(2000, 3000));
+  const newStatus = await findPowerStatus(page);
+  console.log('[开机检测] 点击后状态:', newStatus);
+
+  if (newStatus !== 'Offline') {
+    await tgNotify(
+      'ACLClouds 开机成功\n\n' +
+      '服务器: ' + SERVER_ID + '\n' +
+      '当前状态: ' + (newStatus || '未知') + '\n\n' +
+      '时间: ' + new Date().toISOString()
+    );
+  } else {
+    await tgNotify(
+      'ACLClouds 开机失败\n\n' +
+      '服务器: ' + SERVER_ID + '\n' +
+      '点击 Start 后仍为 Offline\n\n' +
+      '时间: ' + new Date().toISOString()
+    );
+  }
+}
+
 (async () => {
   console.log('[代理]', PROXY_SRV);
   let browser;
@@ -94,11 +179,11 @@ async function findTimeText(page) {
     // ── Step 2: 填邮箱密码 ──
     console.log('[2] 填写邮箱密码...');
     await page.waitForSelector('input[type="email"], #username', { timeout: 30000 });
-    
+
     const emailInput = page.locator('input[type="email"], #username').first();
     await emailInput.click();
     await page.keyboard.type(EMAIL, { delay: randInt(50, 120) });
-    
+
     const pwdInput = page.locator('input[type="password"], #password').first();
     await pwdInput.click();
     await page.keyboard.type(PASSWORD, { delay: randInt(50, 120) });
@@ -118,7 +203,7 @@ async function findTimeText(page) {
         }
         console.log('[Captcha] 已点击，等待网页自动验证...');
         // 等待网页内置 JS 运行并获取验证 Token
-        await page.waitForTimeout(randInt(3500, 5000)); 
+        await page.waitForTimeout(randInt(3500, 5000));
     } else {
         console.log('[Captcha] 未找到验证码复选框，尝试直接登录');
     }
@@ -149,6 +234,9 @@ async function findTimeText(page) {
     await page.waitForTimeout(3000);
     await saveScreenshot(page, 'debug-server.png');
 
+    // ── 新增：检测容器电源状态，如果 Offline 则尝试开机 ──
+    await checkAndStartServer(page);
+
     // ── 等待并读取剩余时间 ──
     console.log('[等待] 查找剩余时间...');
     let remainRaw = null;
@@ -163,8 +251,8 @@ async function findTimeText(page) {
     const remainHours = parseHours(remainText);
     console.log('[时间]', remainText, '->', remainHours.toFixed(1), 'h');
 
-    if (remainHours <= 24) {
-      console.log('[续期] 剩余 <= 1 天，点击续期...');
+    if (remainHours <= RENEW_THRESHOLD_HOURS) {
+      console.log('[续期] 剩余 <= 2 天，点击续期...');
 
       // 点击续期按钮
       const btnText = await page.evaluate(() => {
@@ -238,7 +326,7 @@ async function findTimeText(page) {
       await tgNotify(
         'ACLClouds 无需续期\n\n' +
         '服务器: ' + SERVER_ID + '\n' +
-        '当前剩余: ' + d + ' 天 ' + h + ' 小时（大于 1 天，跳过）\n\n' +
+        '当前剩余: ' + d + ' 天 ' + h + ' 小时（大于 2 天，跳过）\n\n' +
         '时间: ' + new Date().toISOString()
       );
     }
