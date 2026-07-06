@@ -1,0 +1,41 @@
+name: GitHub Actions Keep Alive (Bulletproof)
+
+on:
+  schedule:
+    # 避开整点（00:00）的拥堵时段，改在凌晨 3:17 分触发，能大幅降低 GitHub 节点的延迟
+    - cron: '17 3 */3 * *'
+  workflow_dispatch: 
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Auto Commit to Keep Alive
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          mkdir -p .github
+          echo "Last active: $(date)" > .github/keep-alive.txt
+          
+          git add .github/keep-alive.txt
+          
+          if git diff --staged --quiet; then
+            echo "No changes detected."
+          else
+            git commit -m "chore: github actions keep alive [skip ci]"
+            
+            # 拉取远程最新变动并变基，彻底避免并发推送冲突
+            git pull --rebase origin ${{ github.ref_name }}
+            
+            # 推送到当前分支
+            git push origin HEAD:${{ github.ref }}
+          fi
