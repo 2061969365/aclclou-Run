@@ -258,7 +258,6 @@ class ACLCloudsRenewer:
         self.pw = await async_playwright().start()
         self.browser = await self.pw.chromium.launch(
             headless=True,
-            proxy={"server": PROXY_SRV},
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
