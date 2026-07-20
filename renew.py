@@ -33,13 +33,12 @@ PASSWORD = os.environ.get("ACL_PASSWORD", "")
 SERVER_ID = os.environ.get("ACL_SERVER_ID", "")
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TG_CHAT_ID", "")
-PROXY_SRV = "socks5://127.0.0.1:1080"
 BASE_URL = "https://dash.aclclouds.com"
 RENEW_THRESHOLD_HOURS = 48
 
 COOKIE_DIR = os.environ.get("COOKIE_DIR", os.path.join(tempfile.gettempdir(), "aclclou_cookies"))
 DEBUG_DIR = os.environ.get("DEBUG_DIR", os.path.join(tempfile.gettempdir(), "aclclou_debug"))
-MAX_LOGIN_RETRY = 30
+MAX_LOGIN_RETRY = 5
 SIGNATURE = "ACLClouds Auto Renewal"
 
 USER_AGENT = (
@@ -169,28 +168,27 @@ class CaptchaSolver:
     def __init__(self):
         self.ocr = ddddocr.DdddOcr(show_ad=False)
 
-    async def solve(self, page, max_retries=30) -> bool:
+    async def solve(self, page, max_retries=5) -> bool:
+        checkbox = page.locator(".auth-captcha-checkbox")
+        if await checkbox.count() == 0:
+            log("[CAPTCHA] No checkbox found")
+            return False
+
+        await checkbox.click()
+        log("[CAPTCHA] Clicked checkbox")
+        await asyncio.sleep(2)
+
+        challenge = page.locator(".auth-captcha-challenge")
+        try:
+            await challenge.wait_for(state="visible", timeout=10000)
+        except PlaywrightTimeout:
+            log("[CAPTCHA] Challenge not visible after click")
+            return False
+
         for attempt in range(1, max_retries + 1):
-            log(f"  [CAPTCHA] Attempt {attempt}/{max_retries}")
+            log(f"  [CAPTCHA] OCR attempt {attempt}/{max_retries}")
 
             try:
-                checkbox = page.locator(".auth-captcha-checkbox")
-                if await checkbox.count() == 0:
-                    log("[CAPTCHA] No checkbox found")
-                    await asyncio.sleep(1)
-                    continue
-
-                await checkbox.click()
-                log("[CAPTCHA] Clicked checkbox")
-                await asyncio.sleep(random.uniform(1, 2))
-
-                challenge = page.locator(".auth-captcha-challenge")
-                try:
-                    await challenge.wait_for(state="visible", timeout=10000)
-                except PlaywrightTimeout:
-                    log("[CAPTCHA] Challenge not visible, retrying...")
-                    continue
-
                 prompt_elem = page.locator(".auth-captcha-prompt strong")
                 if await prompt_elem.count() == 0:
                     log("[CAPTCHA] No prompt found")
@@ -211,9 +209,18 @@ class CaptchaSolver:
                     if await img.count() == 0:
                         continue
 
-                    img_bytes = await img.screenshot()
+                    src = await img.get_attribute("src")
+                    if src:
+                        try:
+                            resp = await page.context.request.get(src)
+                            img_bytes = await resp.body()
+                        except Exception:
+                            img_bytes = await img.screenshot()
+                    else:
+                        img_bytes = await img.screenshot()
+
                     try:
-                        recognized = self.ocr.classification(img_bytes).lower()
+                        recognized = self.ocr.classification(img_bytes).lower().strip()
                     except Exception as e:
                         log(f"[CAPTCHA] OCR error on option {idx+1}: {e}")
                         recognized = ""
@@ -223,21 +230,20 @@ class CaptchaSolver:
                     if target_text == recognized or target_text in recognized.split() or recognized in target_text.split():
                         log(f"[CAPTCHA] Match found: option {idx+1}")
                         await option.click()
-                        await asyncio.sleep(random.uniform(1, 2))
+                        await asyncio.sleep(1)
                         return True
 
-                log("[CAPTCHA] No match found, retrying...")
-
-                close_btn = page.locator(".auth-captcha-close, button:has-text('Close')")
-                if await close_btn.count() > 0:
-                    await close_btn.first.click()
+                log("[CAPTCHA] No match, refreshing images...")
+                ref_btn = page.locator(".auth-captcha-refresh, button:has-text('Refresh'), [aria-label*='refresh']")
+                if await ref_btn.count() > 0:
+                    await ref_btn.first.click()
                     await asyncio.sleep(1)
 
             except Exception as e:
                 log(f"[CAPTCHA] Error: {e}")
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
 
-        log("[CAPTCHA] Max retries reached")
+        log("[CAPTCHA] Max OCR retries reached")
         return False
 
 
@@ -343,7 +349,7 @@ class ACLCloudsRenewer:
                 await password_input.press_sequentially(self.password, delay=random.randint(50, 120))
                 await asyncio.sleep(random.uniform(0.3, 0.6))
 
-                captcha_ok = await self.captcha_solver.solve(self.page, max_retries=30)
+                captcha_ok = await self.captcha_solver.solve(self.page, max_retries=5)
                 if not captcha_ok:
                     log("[LOGIN] Captcha failed")
                     continue
