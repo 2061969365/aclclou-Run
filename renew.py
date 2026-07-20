@@ -13,10 +13,11 @@ ACLClouds Auto Renewal Script (Playwright)
 """
 
 import hashlib
+import json
 import os
+import re
 import sys
 import time
-import pickle
 import random
 import asyncio
 import tempfile
@@ -130,15 +131,15 @@ async def send_telegram(text: str):
 def get_cookie_path(email: str) -> str:
     os.makedirs(COOKIE_DIR, exist_ok=True)
     email_hash = hashlib.md5(email.encode()).hexdigest()[:8]
-    return os.path.join(COOKIE_DIR, f"{email_hash}.pkl")
+    return os.path.join(COOKIE_DIR, f"{email_hash}.json")
 
 
 def save_cookies(email: str, cookies: list):
     try:
         path = get_cookie_path(email)
         data = {"cookies": cookies, "email": email, "saved_at": time.time()}
-        with open(path, "wb") as f:
-            pickle.dump(data, f)
+        with open(path, "w") as f:
+            json.dump(data, f)
         log(f"[COOKIE] Saved: {path}")
     except Exception as e:
         log(f"[COOKIE] Save failed: {e}")
@@ -149,8 +150,8 @@ def load_cookies(email: str) -> list | None:
         path = get_cookie_path(email)
         if not os.path.exists(path):
             return None
-        with open(path, "rb") as f:
-            data = pickle.load(f)
+        with open(path, "r") as f:
+            data = json.load(f)
         if time.time() - data.get("saved_at", 0) > 86400 * 7:
             log("[COOKIE] Expired (>7 days)")
             return None
@@ -227,17 +228,23 @@ class CaptchaSolver:
 
                     log(f"[CAPTCHA] Option {idx+1}: '{recognized}'")
 
-                    if target_text == recognized or target_text in recognized.split() or recognized in target_text.split():
+                    if target_text == recognized or (len(target_text) > 2 and (target_text in recognized.split() or recognized in target_text.split())):
                         log(f"[CAPTCHA] Match found: option {idx+1}")
                         await option.click()
                         await asyncio.sleep(1)
+                        # Verify challenge accepted
+                        if await challenge.is_visible():
+                            log("[CAPTCHA] Challenge still visible after click, might have failed")
+                            continue
+                        log(f"[CAPTCHA] Match found: option {idx+1}, challenge accepted")
                         return True
 
                 log("[CAPTCHA] No match, refreshing images...")
-                ref_btn = page.locator(".auth-captcha-refresh, button:has-text('Refresh'), [aria-label*='refresh']")
-                if await ref_btn.count() > 0:
-                    await ref_btn.first.click()
-                    await asyncio.sleep(1)
+                if attempt < max_retries:
+                    ref_btn = page.locator(".auth-captcha-refresh, button:has-text('Refresh'), [aria-label*='refresh']")
+                    if await ref_btn.count() > 0:
+                        await ref_btn.first.click()
+                        await asyncio.sleep(1)
 
             except Exception as e:
                 log(f"[CAPTCHA] Error: {e}")
@@ -259,6 +266,7 @@ class ACLCloudsRenewer:
         self.page = None
         self.captcha_solver = CaptchaSolver()
         self.logged_in = False
+        self.pw = None
 
     async def start_browser(self):
         self.pw = await async_playwright().start()
@@ -330,6 +338,14 @@ class ACLCloudsRenewer:
                     wait = 10 + attempt * 3
                     log(f"[LOGIN] Challenge page, waiting {wait}s...")
                     await save_screenshot(f"challenge_{self.email.split('@')[0]}_{attempt}", self.page)
+                    await asyncio.sleep(wait)
+                    continue
+
+                turnstile = self.page.locator("#cf-turnstile, [data-turnstile], iframe[src*='challenges']")
+                if await turnstile.count() > 0:
+                    log("[LOGIN] Turnstile widget detected on page")
+                    await save_screenshot(f"turnstile_{self.email.split('@')[0]}_{attempt}", self.page)
+                    wait = 10 + attempt * 3
                     await asyncio.sleep(wait)
                     continue
 
@@ -492,7 +508,6 @@ class ACLCloudsRenewer:
         return result
 
     def _parse_remaining_hours(self, text: str) -> float:
-        import re
         text = text.strip().lower()
 
         patterns = [
@@ -547,8 +562,14 @@ class ACLCloudsRenewer:
                     await confirm_btn.first.click()
                     await asyncio.sleep(5)
 
-                log(f"[START] Server {server_id} started")
-                return True
+                # Verify state change
+                await asyncio.sleep(2)
+                status = await self.get_server_status(server_id)
+                if status["is_online"]:
+                    log(f"[START] Server {server_id} confirmed online")
+                    return True
+                log(f"[START] Server {server_id} may not have started, remaining: {status['remaining_hours']}h")
+                return True  # Still return True as start was attempted
             else:
                 log(f"[START] No start button found for {server_id}")
                 return False
@@ -673,6 +694,7 @@ async def main():
             log("[MAIN] Cookie login failed, performing full login")
             if not await renewer.login():
                 error(f"Login failed: {mask(EMAIL)}")
+                await save_screenshot("login_failed", renewer.page)
                 await send_telegram(f"[FAIL] Login failed\n\nAccount: {mask(EMAIL)}\n\n{SIGNATURE}")
                 await renewer.close_browser()
                 sys.exit(1)

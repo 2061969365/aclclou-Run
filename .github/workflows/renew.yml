@@ -60,7 +60,7 @@ jobs:
         run: python renew.py
 
       - name: Save cookies to cache
-        if: always()
+        if: success()
         uses: actions/cache/save@v4
         with:
           path: /tmp/aclclou_cookies
