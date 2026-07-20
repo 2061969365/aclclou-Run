@@ -296,7 +296,7 @@ class ACLCloudsRenewer:
             return False
         try:
             await self.context.add_cookies(cookies)
-            await self.page.goto(f"{BASE_URL}/server/", wait_until="domcontentloaded", timeout=30000)
+            await self.page.goto(f"{BASE_URL}/server/", wait_until="networkidle", timeout=60000)
             await asyncio.sleep(2)
             if "/server/" in self.page.url and "/auth/" not in self.page.url:
                 log(f"[COOKIE] {mask(self.email)} cookie valid, logged in")
@@ -321,22 +321,24 @@ class ACLCloudsRenewer:
             try:
                 await self.page.goto(
                     f"{BASE_URL}/auth/login",
-                    wait_until="domcontentloaded",
-                    timeout=30000,
+                    wait_until="networkidle",
+                    timeout=60000,
                 )
-                await asyncio.sleep(random.uniform(1, 2))
+                await asyncio.sleep(random.uniform(2, 3))
 
-                if "challenge" in self.page.url.lower() or "cloudflare" in (await self.page.content()).lower():
+                if "challenge" in self.page.url.lower():
                     wait = 10 + attempt * 3
-                    log(f"[LOGIN] Cloudflare detected, waiting {wait}s...")
-                    await save_screenshot(f"cloudflare_{self.email.split('@')[0]}_{attempt}", self.page)
+                    log(f"[LOGIN] Challenge page, waiting {wait}s...")
+                    await save_screenshot(f"challenge_{self.email.split('@')[0]}_{attempt}", self.page)
                     await asyncio.sleep(wait)
                     continue
 
-                email_input = self.page.locator('input[name="email"], input[type="email"], #username')
-                if await email_input.count() == 0:
-                    log("[LOGIN] Email input not found")
-                    await save_screenshot(f"no_email_input_{self.email.split('@')[0]}_{attempt}", self.page)
+                try:
+                    email_input = self.page.locator('input[name="email"], input[type="email"], #username')
+                    await email_input.first.wait_for(state="visible", timeout=15000)
+                except PlaywrightTimeout:
+                    log("[LOGIN] Email input not loaded after SPA render")
+                    await save_screenshot(f"no_form_{self.email.split('@')[0]}_{attempt}", self.page)
                     await asyncio.sleep(3)
                     continue
 
