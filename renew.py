@@ -329,12 +329,14 @@ class ACLCloudsRenewer:
                 if "challenge" in self.page.url.lower() or "cloudflare" in (await self.page.content()).lower():
                     wait = 10 + attempt * 3
                     log(f"[LOGIN] Cloudflare detected, waiting {wait}s...")
+                    await save_screenshot(f"cloudflare_{self.email.split('@')[0]}_{attempt}", self.page)
                     await asyncio.sleep(wait)
                     continue
 
                 email_input = self.page.locator('input[name="email"], input[type="email"], #username')
                 if await email_input.count() == 0:
                     log("[LOGIN] Email input not found")
+                    await save_screenshot(f"no_email_input_{self.email.split('@')[0]}_{attempt}", self.page)
                     await asyncio.sleep(3)
                     continue
 
