@@ -1,0 +1,92 @@
+name: ACLClouds Renew
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Setup WARP
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
+
+      - name: Fix DNS
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
+          echo "Public IP: $(curl -s --max-time 10 https://api.ipify.org)"
+          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
+
+      - name: Restore cookies from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/aclclou_cookies
+          key: aclclou-cookies-${{ github.run_id }}
+          restore-keys: aclclou-cookies-
+
+      - name: Run renewal script
+        env:
+          ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
+          ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
+          ACL_SERVER_ID: ${{ secrets.ACL_SERVER_ID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          COOKIE_DIR: /tmp/aclclou_cookies
+          DEBUG_DIR: /tmp/aclclou_debug
+        run: python renew.py
+
+      - name: Save cookies to cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/aclclou_cookies
+          key: aclclou-cookies-${{ github.run_id }}
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_id }}
+          path: /tmp/aclclou_debug/
+          retention-days: 7
+
+      - name: Notify via Telegram
+        if: always()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            MSG="✅ ACLClouds renewal completed successfully"
+          else
+            MSG="❌ ACLClouds renewal failed"
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" \
+            -d text="${MSG}" \
+            -d parse_mode="HTML"

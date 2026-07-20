@@ -1,0 +1,4 @@
+ddddocr
+playwright
+Pillow
+aiohttp
