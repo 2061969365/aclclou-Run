@@ -389,23 +389,40 @@ class ACLCloudsRenewer:
                     log("[LOGIN] Login button not found")
                     continue
 
-                async with self.page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
-                    await login_btn.first.click()
-                await asyncio.sleep(2)
+                await login_btn.first.click()
+
+                try:
+                    await self.page.wait_for_function(
+                        'window.location.href && '
+                        'window.location.href !== "about:blank" && '
+                        '!window.location.href.includes("/auth/")',
+                        timeout=15000,
+                    )
+                except (TimeoutError, Exception):
+                    pass
+
+                await asyncio.sleep(1)
+                try:
+                    await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except (TimeoutError, Exception):
+                    pass
 
                 current_url = self.page.url
-                page_content = await self.page.content()
+                log(f"[LOGIN] Post-submit URL: {current_url!r}")
 
-                if "/server/" in current_url and "/auth/" not in current_url:
+                if current_url and current_url not in ("about:blank",) and "/auth/" not in current_url:
                     log(f"[LOGIN] Success: {mask(self.email)} (attempt {attempt})")
                     self.logged_in = True
                     cookies = await self.context.cookies()
                     save_cookies(self.email, cookies)
                     return True
 
+                page_content = await self.page.content()
+                log(f"[LOGIN] Still on login page, size={len(page_content)}")
+
                 if "incorrect" in page_content.lower() or "invalid" in page_content.lower():
                     if "password" in page_content.lower():
-                        log(f"[LOGIN] Password error (may be cleared), retrying...")
+                        log(f"[LOGIN] Password error, retrying...")
                         await asyncio.sleep(random.uniform(1, 2))
                         continue
                     if "captcha" in page_content.lower() or "code" in page_content.lower():
@@ -413,11 +430,13 @@ class ACLCloudsRenewer:
                         await asyncio.sleep(random.uniform(1, 2))
                         continue
 
-                log(f"[LOGIN] Unknown result, page size: {len(page_content)}")
+                await save_screenshot(f"login_stuck_{self.email.split('@')[0]}_{attempt}", self.page)
+                log(f"[LOGIN] Unknown result, retrying...")
                 await asyncio.sleep(random.uniform(2, 4))
 
             except Exception as e:
                 log(f"[LOGIN] Error: {e}")
+                await save_screenshot(f"login_error_{self.email.split('@')[0]}_{attempt}", self.page)
                 await asyncio.sleep(random.uniform(3, 6))
 
         log(f"[LOGIN] Failed: {mask(self.email)} after {MAX_LOGIN_RETRY} attempts")
