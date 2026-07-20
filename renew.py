@@ -342,21 +342,31 @@ class ACLCloudsRenewer:
                     await asyncio.sleep(3)
                     continue
 
-                await email_input.press_sequentially(self.email, delay=random.randint(50, 120))
-                await asyncio.sleep(random.uniform(0.3, 0.6))
+                await email_input.fill(self.email)
+                await asyncio.sleep(random.uniform(0.5, 1.0))
 
                 password_input = self.page.locator('input[name="password"], input[type="password"], #password')
                 if await password_input.count() == 0:
                     log("[LOGIN] Password input not found")
                     continue
 
-                await password_input.press_sequentially(self.password, delay=random.randint(50, 120))
-                await asyncio.sleep(random.uniform(0.3, 0.6))
+                await password_input.fill(self.password)
+                await asyncio.sleep(random.uniform(0.5, 1.0))
 
                 captcha_ok = await self.captcha_solver.solve(self.page, max_retries=5)
                 if not captcha_ok:
                     log("[LOGIN] Captcha failed")
                     continue
+
+                current_email = await email_input.input_value()
+                current_password = await password_input.input_value()
+                if not current_email or not current_password:
+                    log(f"[LOGIN] Fields cleared (email={bool(current_email)}, pwd={bool(current_password)}), re-entering...")
+                    if not current_email:
+                        await email_input.fill(self.email)
+                    if not current_password:
+                        await password_input.fill(self.password)
+                    await asyncio.sleep(0.5)
 
                 login_btn = self.page.locator('button:has-text("Sign in"), button:has-text("Login"), button[type="submit"]')
                 if await login_btn.count() == 0:
@@ -379,8 +389,9 @@ class ACLCloudsRenewer:
 
                 if "incorrect" in page_content.lower() or "invalid" in page_content.lower():
                     if "password" in page_content.lower():
-                        log(f"[LOGIN] Wrong password: {mask(self.email)}")
-                        return False
+                        log(f"[LOGIN] Password error (may be cleared), retrying...")
+                        await asyncio.sleep(random.uniform(1, 2))
+                        continue
                     if "captcha" in page_content.lower() or "code" in page_content.lower():
                         log(f"[LOGIN] Captcha error, retrying...")
                         await asyncio.sleep(random.uniform(1, 2))
