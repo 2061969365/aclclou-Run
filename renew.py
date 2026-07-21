@@ -267,6 +267,7 @@ class ACLCloudsRenewer:
         self.captcha_solver = CaptchaSolver()
         self.logged_in = False
         self.pw = None
+        self.server_ids = []
 
     async def start_browser(self):
         self.pw = await async_playwright().start()
@@ -304,9 +305,9 @@ class ACLCloudsRenewer:
             return False
         try:
             await self.context.add_cookies(cookies)
-            await self.page.goto(f"{BASE_URL}/server/", wait_until="networkidle", timeout=60000)
+            await self.page.goto(f"{BASE_URL}/dashboard/projects", wait_until="networkidle", timeout=60000)
             await asyncio.sleep(2)
-            if "/server/" in self.page.url and "/auth/" not in self.page.url:
+            if "/dashboard/" in self.page.url and "/auth/" not in self.page.url:
                 log(f"[COOKIE] {mask(self.email)} cookie valid, logged in")
                 self.logged_in = True
                 return True
@@ -398,13 +399,13 @@ class ACLCloudsRenewer:
                         '!window.location.href.includes("/auth/")',
                         timeout=15000,
                     )
-                except (TimeoutError, Exception):
+                except (PlaywrightTimeout, TimeoutError, Exception):
                     pass
 
                 await asyncio.sleep(1)
                 try:
                     await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
-                except (TimeoutError, Exception):
+                except (PlaywrightTimeout, TimeoutError, Exception):
                     pass
 
                 current_url = self.page.url
@@ -456,8 +457,6 @@ class ACLCloudsRenewer:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
 
-            content = await self.page.content()
-
             time_text = ""
             for selector in [
                 "text=Time remaining",
@@ -465,6 +464,10 @@ class ACLCloudsRenewer:
                 ".time-remaining",
                 "[class*=time]",
                 "[class*=countdown]",
+                "[class*=expiry]",
+                "text=Remaining",
+                "text=Expires",
+                "text=到期",
             ]:
                 elem = self.page.locator(selector)
                 if await elem.count() > 0:
@@ -597,84 +600,129 @@ class ACLCloudsRenewer:
             log(f"[START] Error: {e}")
             return False
 
-    # ── 续期 ──
+    # ── Turnstile 暴力破解 ──
+    async def _brute_force_turnstile(self, page, max_attempts=20) -> bool:
+        log(f"[TURNSTILE] Starting brute force (max {max_attempts} attempts)")
+
+        for i in range(max_attempts):
+            success_text = page.locator("text=Server renewed successfully")
+            if await success_text.count() > 0:
+                log(f"[TURNSTILE] Already resolved, skip clicking")
+                return True
+
+            frame = page.frame(url="*challenges*")
+            target = None
+            if frame:
+                target = frame.locator("text=I am not a robot")
+            if not target or await target.count() == 0:
+                target = page.locator("text=I am not a robot")
+
+            if await target.count() > 0:
+                box = await target.bounding_box()
+                if box:
+                    x = box["width"] / 2
+                    y = box["height"] / 2
+                    await page.mouse.move(box["x"] + x, box["y"] + y * 4)
+                    await asyncio.sleep(random.uniform(1, 2))
+                    await page.mouse.click(box["x"] + x, box["y"] + y * 4)
+                    log(f"[TURNSTILE] Clicked attempt {i+1}/{max_attempts} (Y*4 offset)")
+            else:
+                log(f"[TURNSTILE] Attempt {i+1}/{max_attempts}: 'I am not a robot' not found")
+
+            await asyncio.sleep(3)
+
+            if await success_text.count() > 0:
+                log(f"[TURNSTILE] Resolved after {i+1} attempts")
+                return True
+
+        log("[TURNSTILE] Max attempts reached, may not have resolved")
+        return False
+
+    # ── 续期（暴力点击 Turnstile） ──
     async def renew_server(self, server_id: str, old_remaining_hours: float = -1) -> dict:
         result = {
             "success": False,
             "server_id": server_id,
-            "old_remaining": "",
+            "old_remaining": fmt_hours(old_remaining_hours) if old_remaining_hours >= 0 else "unknown",
             "new_remaining": "",
             "message": "",
         }
+        name = f"renew_{server_id}_{int(time.time())}"
 
         try:
-            url = f"{BASE_URL}/server/{server_id}"
-            await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await self.page.goto(f"{BASE_URL}/dashboard/projects", wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(random.uniform(2, 3))
+
+            await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(1)
+
+            await self.page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('button')];
+                const closeBtn = btns.find(b => b.innerText.trim() === 'Close');
+                if (closeBtn) closeBtn.click();
+            }""")
             await asyncio.sleep(2)
 
-            content = await self.page.content()
-
             renew_btn = self.page.locator(
-                'button:has-text("Renew"), button:has-text("Renouveler"), '
-                'button:has-text("Extend"), button:has-text("Prolonger"), '
-                'a:has-text("Renew"), a:has-text("Renouveler")'
+                f'*:has-text("{server_id}"):has(button:has-text("Renew"))'
+                ' button:has-text("Renew")'
             )
+            if await renew_btn.count() == 0:
+                renew_btn = self.page.locator(
+                    'button:has-text("Renew"), button:has-text("Renouveler"), '
+                    'button:has-text("Extend"), button:has-text("Prolonger")'
+                )
 
             if await renew_btn.count() == 0:
-                result["message"] = "Renew button not found"
-                log(f"[RENEW] {result['message']}")
+                result["message"] = "No Renew button found"
+                log(f"[RENEW] {result['message']} for {server_id}")
+                await save_screenshot(name, self.page)
                 return result
 
             await renew_btn.first.click()
-            log("[RENEW] Clicked renew button")
-            await asyncio.sleep(3)
+            log(f"[RENEW] Clicked Renew for {server_id}")
+            await asyncio.sleep(random.uniform(2, 3))
 
-            confirm_btn = self.page.locator(
-                'button:has-text("Confirm"), button:has-text("Yes"), '
-                'button:has-text("Oui"), button:has-text("OK")'
-            )
-            if await confirm_btn.count() > 0:
-                await confirm_btn.first.click()
-                await asyncio.sleep(2)
+            turnstile_ok = await self._brute_force_turnstile(self.page)
+            if not turnstile_ok:
+                log("[RENEW] Turnstile not resolved, checking result anyway...")
+            await save_screenshot(name, self.page)
 
-            loading_indicators = [
-                "text=Renewing...",
-                "text=Renouvellement...",
-                "text=Processing...",
-                ".loading",
-                ".spinner",
-            ]
-            for sel in loading_indicators:
-                elem = self.page.locator(sel)
-                if await elem.count() > 0:
-                    log("[RENEW] Waiting for renewal to complete...")
-                    try:
-                        await elem.first.wait_for(state="hidden", timeout=60000)
-                    except PlaywrightTimeout:
-                        pass
-                    break
+            if await self.page.locator("text=Server renewed successfully").count() > 0:
+                log("[RENEW] Server renewed successfully text found")
+                result["success"] = True
+                result["message"] = "Renewal successful (via text)"
 
-            await asyncio.sleep(3)
-            await self.page.wait_for_load_state("domcontentloaded", timeout=15000)
-
+            await self.page.goto(f"{BASE_URL}/server/{server_id}", wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
             new_status = await self.get_server_status(server_id)
             new_hours = new_status["remaining_hours"]
-            if new_hours > 0 and (old_remaining_hours < 0 or new_hours > old_remaining_hours + 0.5):
-                result["success"] = True
-                result["new_remaining"] = fmt_hours(new_hours)
-                result["message"] = "Renewal successful"
-            elif old_remaining_hours >= 0 and new_hours > old_remaining_hours:
-                result["success"] = True
-                result["new_remaining"] = fmt_hours(new_hours)
-                result["message"] = "Renewal partially extended"
+
+            if old_remaining_hours >= 0:
+                if new_hours > old_remaining_hours + 0.5:
+                    result["success"] = True
+                    result["new_remaining"] = fmt_hours(new_hours)
+                    result["message"] = "Renewal successful"
+                elif new_hours > old_remaining_hours:
+                    result["success"] = True
+                    result["new_remaining"] = fmt_hours(new_hours)
+                    result["message"] = "Renewal partially extended"
+                else:
+                    result["new_remaining"] = fmt_hours(new_hours)
+                    result["message"] = f"Time not increased (old={fmt_hours(old_remaining_hours)}, new={fmt_hours(new_hours)})"
             else:
-                result["message"] = "Renewal result unknown"
+                result["new_remaining"] = fmt_hours(new_hours)
+                if result["success"]:
+                    result["message"] = f"Renewal successful (new={fmt_hours(new_hours)})"
+                else:
+                    result["message"] = f"Renewal result unknown (new={fmt_hours(new_hours)})"
 
             log(f"[RENEW] Result: {result['message']}")
 
         except Exception as e:
             result["message"] = f"Error: {e}"
             log(f"[RENEW] Error: {e}")
+            await save_screenshot(f"renew_error_{server_id}", self.page)
 
         return result
 
@@ -704,6 +752,7 @@ async def main():
     log(f"Account: {mask(EMAIL)} | Servers: {len(server_ids)} | Threshold: {RENEW_THRESHOLD_HOURS}h")
 
     renewer = ACLCloudsRenewer(EMAIL, PASSWORD)
+    renewer.server_ids = server_ids
 
     try:
         await renewer.start_browser()
@@ -765,9 +814,17 @@ async def main():
                         f"{SIGNATURE}"
                     )
 
+            MAX_RENEW_RETRY = 3
+
             if status["remaining_hours"] >= 0 and status["remaining_hours"] <= RENEW_THRESHOLD_HOURS:
                 log(f"[MAIN] Server {sid} needs renewal ({fmt_hours(status['remaining_hours'])} remaining)")
-                renew_result = await renewer.renew_server(sid, old_remaining_hours=status["remaining_hours"])
+                for attempt in range(1, MAX_RENEW_RETRY + 1):
+                    renew_result = await renewer.renew_server(sid, old_remaining_hours=status["remaining_hours"])
+                    if renew_result["success"]:
+                        break
+                    if attempt < MAX_RENEW_RETRY:
+                        log(f"[MAIN] Renew retry {attempt}/{MAX_RENEW_RETRY} for {sid}")
+                        await asyncio.sleep(5 * attempt)
 
                 if renew_result["success"]:
                     STATS["renewals"] += 1
@@ -792,7 +849,14 @@ async def main():
                 log(f"[MAIN] Server {sid} skipped ({fmt_hours(status['remaining_hours'])} remaining)")
             else:
                 log(f"[MAIN] Server {sid} remaining time unknown, attempting renewal anyway")
-                renew_result = await renewer.renew_server(sid)
+                for attempt in range(1, MAX_RENEW_RETRY + 1):
+                    renew_result = await renewer.renew_server(sid)
+                    if renew_result["success"]:
+                        break
+                    if attempt < MAX_RENEW_RETRY:
+                        log(f"[MAIN] Renew retry {attempt}/{MAX_RENEW_RETRY} for {sid}")
+                        await asyncio.sleep(5 * attempt)
+
                 if renew_result["success"]:
                     STATS["renewals"] += 1
                 else:
