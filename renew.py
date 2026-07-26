@@ -621,25 +621,10 @@ class ACLCloudsRenewer:
 
             log(f"[TURNSTILE] Anti-bot confirmation dialog detected")
 
-            target = None
-            for f in page.frames:
-                if f != page.main_frame:
-                    try:
-                        checkbox = f.locator("text=I am not a robot")
-                        if await checkbox.count() > 0:
-                            target = checkbox
-                            log(f"[TURNSTILE] Found checkbox in frame: {f.url[:80]}")
-                            break
-                    except:
-                        pass
-
-            if not target or await target.count() == 0:
-                target = page.locator("text=I am not a robot")
-                if await target.count() > 0:
-                    log(f"[TURNSTILE] Found checkbox in main page")
-
-            if await target.count() > 0:
-                box = await target.bounding_box()
+            # 点击"I am not a robot"复选框
+            checkbox = page.locator("text=I am not a robot")
+            if await checkbox.count() > 0:
+                box = await checkbox.bounding_box()
                 if box:
                     cx = box["x"] + box["width"] / 2
                     cy = box["y"] + box["height"] / 2
@@ -653,12 +638,95 @@ class ACLCloudsRenewer:
                     log(f"[TURNSTILE] Could not get bounding box")
             else:
                 log(f"[TURNSTILE] Attempt {i+1}/{max_attempts}: 'I am not a robot' not found")
+                await asyncio.sleep(3)
+                if await success_text.count() > 0:
+                    log(f"[TURNSTILE] Resolved after {i+1} attempts")
+                    return True
+                continue
+
+            await asyncio.sleep(2)
+
+            # 检查是否有CAPTCHA挑战出现（与登录页相同结构）
+            challenge = page.locator(".auth-captcha-challenge")
+            if await challenge.is_visible():
+                log(f"[TURNSTILE] CAPTCHA challenge detected, solving...")
+                for ocr_attempt in range(1, 6):
+                    prompt_elem = page.locator(".auth-captcha-prompt strong")
+                    if await prompt_elem.count() == 0:
+                        log("[TURNSTILE] No CAPTCHA prompt found")
+                        break
+
+                    target_text = (await prompt_elem.inner_text()).strip().lower()
+                    log(f"[TURNSTILE] CAPTCHA target: '{target_text}'")
+
+                    options = page.locator(".auth-captcha-option")
+                    count = await options.count()
+                    if count != 4:
+                        log(f"[TURNSTILE] Expected 4 options, got {count}")
+                        if count == 0:
+                            break
+                        continue
+
+                    solved = False
+                    for idx in range(count):
+                        option = options.nth(idx)
+                        img = option.locator(".auth-captcha-option-img")
+                        if await img.count() == 0:
+                            continue
+
+                        src = await img.get_attribute("src")
+                        if src:
+                            try:
+                                resp = await page.context.request.get(src)
+                                img_bytes = await resp.body()
+                            except Exception:
+                                img_bytes = await img.screenshot()
+                        else:
+                            img_bytes = await img.screenshot()
+
+                        try:
+                            recognized = self.captcha_solver.ocr.classification(img_bytes).lower().strip()
+                        except Exception as e:
+                            log(f"[TURNSTILE] OCR error on option {idx+1}: {e}")
+                            recognized = ""
+
+                        log(f"[TURNSTILE] Option {idx+1}: '{recognized}'")
+
+                        if target_text == recognized or (len(target_text) > 2 and (target_text in recognized.split() or recognized in target_text.split())):
+                            log(f"[TURNSTILE] Match found: option {idx+1}")
+                            await option.click()
+                            await asyncio.sleep(1)
+                            if await challenge.is_visible():
+                                log("[TURNSTILE] Challenge still visible after click, retrying...")
+                                continue
+                            log("[TURNSTILE] Challenge accepted")
+                            solved = True
+                            break
+
+                    if solved:
+                        log("[TURNSTILE] CAPTCHA solved successfully")
+                        await asyncio.sleep(3)
+                        break
+
+                    log(f"[TURNSTILE] OCR attempt {ocr_attempt} failed, refreshing...")
+                    if ocr_attempt < 5:
+                        ref_btn = page.locator(".auth-captcha-refresh, button:has-text('Refresh'), [aria-label*='refresh']")
+                        if await ref_btn.count() > 0:
+                            await ref_btn.first.click()
+                            await asyncio.sleep(1)
 
             await asyncio.sleep(3)
 
             if await success_text.count() > 0:
                 log(f"[TURNSTILE] Resolved after {i+1} attempts")
                 return True
+
+            # 如果对话框消失了也视为成功
+            if await anti_bot.count() == 0:
+                log(f"[TURNSTILE] Anti-bot dialog dismissed")
+                await asyncio.sleep(2)
+                if await success_text.count() > 0:
+                    return True
 
         log("[TURNSTILE] Max attempts reached, may not have resolved")
         return False
