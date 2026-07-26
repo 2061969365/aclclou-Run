@@ -600,7 +600,7 @@ class ACLCloudsRenewer:
             log(f"[START] Error: {e}")
             return False
 
-    # ── Turnstile 暴力破解 ──
+    # ── 反机器人验证处理（ACLClouds 自定义验证） ──
     async def _brute_force_turnstile(self, page, max_attempts=20) -> bool:
         log(f"[TURNSTILE] Starting brute force (max {max_attempts} attempts)")
 
@@ -610,22 +610,47 @@ class ACLCloudsRenewer:
                 log(f"[TURNSTILE] Already resolved, skip clicking")
                 return True
 
-            frame = page.frame(url="*challenges*")
+            anti_bot = page.locator("text=/Anti-bot confirmation/i")
+            if await anti_bot.count() == 0:
+                log(f"[TURNSTILE] Attempt {i+1}/{max_attempts}: No Anti-bot dialog, checking success...")
+                await asyncio.sleep(3)
+                if await success_text.count() > 0:
+                    log(f"[TURNSTILE] Resolved after {i+1} attempts")
+                    return True
+                continue
+
+            log(f"[TURNSTILE] Anti-bot confirmation dialog detected")
+
             target = None
-            if frame:
-                target = frame.locator("text=I am not a robot")
+            for f in page.frames:
+                if f != page.main_frame:
+                    try:
+                        checkbox = f.locator("text=I am not a robot")
+                        if await checkbox.count() > 0:
+                            target = checkbox
+                            log(f"[TURNSTILE] Found checkbox in frame: {f.url[:80]}")
+                            break
+                    except:
+                        pass
+
             if not target or await target.count() == 0:
                 target = page.locator("text=I am not a robot")
+                if await target.count() > 0:
+                    log(f"[TURNSTILE] Found checkbox in main page")
 
             if await target.count() > 0:
                 box = await target.bounding_box()
                 if box:
-                    x = box["width"] / 2
-                    y = box["height"] / 2
-                    await page.mouse.move(box["x"] + x, box["y"] + y * 4)
-                    await asyncio.sleep(random.uniform(1, 2))
-                    await page.mouse.click(box["x"] + x, box["y"] + y * 4)
-                    log(f"[TURNSTILE] Clicked attempt {i+1}/{max_attempts} (Y*4 offset)")
+                    cx = box["x"] + box["width"] / 2
+                    cy = box["y"] + box["height"] / 2
+                    await page.mouse.move(cx + random.uniform(-3, 3), cy + random.uniform(-3, 3))
+                    await asyncio.sleep(random.uniform(0.2, 0.5))
+                    await page.mouse.move(cx, cy)
+                    await asyncio.sleep(random.uniform(0.1, 0.3))
+                    await page.mouse.click(cx, cy)
+                    log(f"[TURNSTILE] Clicked checkbox attempt {i+1}/{max_attempts} at ({cx:.0f}, {cy:.0f})")
+                else:
+                    log(f"[TURNSTILE] Could not get bounding box")
             else:
                 log(f"[TURNSTILE] Attempt {i+1}/{max_attempts}: 'I am not a robot' not found")
 
@@ -662,6 +687,13 @@ class ACLCloudsRenewer:
                 if (closeBtn) closeBtn.click();
             }""")
             await asyncio.sleep(2)
+
+            renewal_unavailable = self.page.locator("text=/Renewal will be available/i")
+            if await renewal_unavailable.count() > 0:
+                log(f"[RENEW] Renewal not yet available for server {server_id} (within 48h threshold)")
+                result["success"] = True
+                result["message"] = "Renewal not yet available (within window)"
+                return result
 
             renew_btn = self.page.locator(
                 f'*:has-text("{server_id}"):has(button:has-text("Renew"))'
