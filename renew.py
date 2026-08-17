@@ -567,38 +567,53 @@ class ACLCloudsRenewer:
         return total_hours if found else -1
 
     # ── 开机 ──
-    async def start_server(self, server_id: str) -> bool:
+    async def start_server(self, server_id: str) -> str:
+        """尝试启动离线服务器。
+
+        返回值:
+          "started"     - 已点击启动按钮
+          "unavailable" - 当前无法启动（按钮缺失/禁用），不算失败
+          "failed"      - 启动过程中出现意外错误
+        """
         try:
             url = f"{BASE_URL}/server/{server_id}"
             await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
 
             start_btn = self.page.locator('button.power-btn[data-variant="start"], button:has-text("Start"), button:has-text("Démarrer")')
-            if await start_btn.count() > 0:
-                await start_btn.first.click()
-                log(f"[START] Clicked start button for {server_id}")
-                await asyncio.sleep(10)
-
-                confirm_btn = self.page.locator('button:has-text("Confirm"), button:has-text("Yes"), button:has-text("Oui")')
-                if await confirm_btn.count() > 0:
-                    await confirm_btn.first.click()
-                    await asyncio.sleep(5)
-
-                # Verify state change
-                await asyncio.sleep(2)
-                status = await self.get_server_status(server_id)
-                if status["is_online"]:
-                    log(f"[START] Server {server_id} confirmed online")
-                    return True
-                log(f"[START] Server {server_id} may not have started, remaining: {status['remaining_hours']}h")
-                return True  # Still return True as start was attempted
-            else:
+            if await start_btn.count() == 0:
                 log(f"[START] No start button found for {server_id}")
-                return False
+                return "unavailable"
+
+            try:
+                await start_btn.first.click(timeout=15000)
+            except PlaywrightTimeout:
+                log(f"[START] Start button is disabled for {server_id}, skipping start")
+                return "unavailable"
+
+            log(f"[START] Clicked start button for {server_id}")
+            await asyncio.sleep(10)
+
+            confirm_btn = self.page.locator('button:has-text("Confirm"), button:has-text("Yes"), button:has-text("Oui")')
+            if await confirm_btn.count() > 0:
+                try:
+                    await confirm_btn.first.click(timeout=5000)
+                    await asyncio.sleep(5)
+                except PlaywrightTimeout:
+                    log(f"[START] Confirm dialog disappeared for {server_id}, continuing")
+
+            # Verify state change
+            await asyncio.sleep(2)
+            status = await self.get_server_status(server_id)
+            if status["is_online"]:
+                log(f"[START] Server {server_id} confirmed online")
+                return "started"
+            log(f"[START] Server {server_id} may not have started, remaining: {status['remaining_hours']}h")
+            return "started"  # Still return started as start was attempted
 
         except Exception as e:
             log(f"[START] Error: {e}")
-            return False
+            return "failed"
 
     # ── 反机器人验证处理（ACLClouds 自定义验证） ──
     async def _brute_force_turnstile(self, page, max_attempts=20) -> bool:
@@ -896,8 +911,8 @@ async def main():
 
             if not status["is_online"]:
                 log(f"[MAIN] Server {sid} is offline, starting...")
-                start_ok = await renewer.start_server(sid)
-                if start_ok:
+                start_result = await renewer.start_server(sid)
+                if start_result == "started":
                     STATS["starts"] += 1
                     await send_telegram(
                         f"[START] Server started\n\n"
@@ -905,6 +920,8 @@ async def main():
                         f"Server: {sid}\n\n"
                         f"{SIGNATURE}"
                     )
+                elif start_result == "unavailable":
+                    log(f"[MAIN] Server {sid} start unavailable, continuing...")
                 else:
                     STATS["failures"] += 1
                     await send_telegram(
