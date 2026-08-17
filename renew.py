@@ -585,21 +585,27 @@ class ACLCloudsRenewer:
                 log(f"[START] No start button found for {server_id}")
                 return "unavailable"
 
+            if await start_btn.first.is_disabled():
+                log(f"[START] Start button is disabled for {server_id}, skipping start")
+                return "unavailable"
+
             try:
                 await start_btn.first.click(timeout=15000)
             except PlaywrightTimeout:
-                log(f"[START] Start button is disabled for {server_id}, skipping start")
+                log(f"[START] Start button click timed out for {server_id}, skipping start")
                 return "unavailable"
 
             log(f"[START] Clicked start button for {server_id}")
             await asyncio.sleep(10)
 
+            confirm_timeout = False
             confirm_btn = self.page.locator('button:has-text("Confirm"), button:has-text("Yes"), button:has-text("Oui")')
             if await confirm_btn.count() > 0:
                 try:
                     await confirm_btn.first.click(timeout=5000)
                     await asyncio.sleep(5)
                 except PlaywrightTimeout:
+                    confirm_timeout = True
                     log(f"[START] Confirm dialog disappeared for {server_id}, continuing")
 
             # Verify state change
@@ -608,6 +614,9 @@ class ACLCloudsRenewer:
             if status["is_online"]:
                 log(f"[START] Server {server_id} confirmed online")
                 return "started"
+            if confirm_timeout:
+                log(f"[START] Server {server_id} still offline after confirm timeout, treating as unavailable")
+                return "unavailable"
             log(f"[START] Server {server_id} may not have started, remaining: {status['remaining_hours']}h")
             return "started"  # Still return started as start was attempted
 
