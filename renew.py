@@ -23,6 +23,8 @@ import asyncio
 import tempfile
 from datetime import datetime
 
+import difflib
+
 import ddddocr
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
@@ -172,19 +174,78 @@ class CaptchaSolver:
     async def solve(self, page, max_retries=5) -> bool:
         checkbox = page.locator(".auth-captcha-checkbox")
         if await checkbox.count() == 0:
+            # 兼容：有些版本直接显示 Verified，无需点击
+            verified = page.locator("text=Verified")
+            if await verified.count() > 0 and await verified.first.is_visible():
+                log("[CAPTCHA] Already verified without checkbox")
+                return True
             log("[CAPTCHA] No checkbox found")
             return False
 
-        await checkbox.click()
+        # 已是 Verified 状态则直接成功
+        try:
+            txt = (await checkbox.inner_text()).lower()
+            if "verified" in txt:
+                log("[CAPTCHA] Already verified")
+                return True
+        except Exception:
+            pass
+
+        # 人性化点击（避免被检测为自动化）
+        try:
+            box = await checkbox.bounding_box()
+            if box:
+                cx = box["x"] + box["width"] / 2 + random.uniform(-3, 3)
+                cy = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+                await page.mouse.move(cx, cy)
+                await asyncio.sleep(random.uniform(0.2, 0.5))
+                await page.mouse.click(cx, cy)
+            else:
+                await checkbox.click()
+        except Exception:
+            try:
+                await checkbox.click()
+            except Exception:
+                pass
         log("[CAPTCHA] Clicked checkbox")
         await asyncio.sleep(2)
 
         challenge = page.locator(".auth-captcha-challenge")
+        verified_indicator = page.locator("text=Verified")
+
         try:
-            await challenge.wait_for(state="visible", timeout=10000)
+            await challenge.wait_for(state="visible", timeout=8000)
         except PlaywrightTimeout:
-            log("[CAPTCHA] Challenge not visible after click")
-            return False
+            await asyncio.sleep(1)
+            # WARP 可信 IP 下点击后直接 Verified，无需图片挑战 - 视为成功（本次截图就是此情况）
+            try:
+                if await verified_indicator.count() > 0 and await verified_indicator.first.is_visible():
+                    log("[CAPTCHA] Verified without challenge - success")
+                    return True
+            except Exception:
+                pass
+            try:
+                txt = (await checkbox.inner_text()).lower()
+                if "verified" in txt:
+                    log("[CAPTCHA] Verified without challenge (checkbox) - success")
+                    return True
+            except Exception:
+                pass
+            # 无挑战也可能是网络延迟，再等2秒后仍无挑战则按成功处理，允许后续点击 Sign in
+            await asyncio.sleep(2)
+            if await challenge.count() > 0:
+                try:
+                    if await challenge.is_visible():
+                        log("[CAPTCHA] Challenge appeared after delay")
+                    else:
+                        log("[CAPTCHA] No challenge required, assuming verified")
+                        return True
+                except Exception:
+                    log("[CAPTCHA] No challenge required, assuming verified")
+                    return True
+            else:
+                log("[CAPTCHA] No challenge required, assuming verified")
+                return True
 
         for attempt in range(1, max_retries + 1):
             log(f"  [CAPTCHA] OCR attempt {attempt}/{max_retries}")
@@ -228,8 +289,17 @@ class CaptchaSolver:
 
                     log(f"[CAPTCHA] Option {idx+1}: '{recognized}'")
 
-                    if target_text == recognized or (len(target_text) > 2 and (target_text in recognized.split() or recognized in target_text.split())):
-                        log(f"[CAPTCHA] Match found: option {idx+1}")
+                    # 模糊匹配：容错 OCR 拼写误差（如 minecra vs minecraft）
+                    ratio = difflib.SequenceMatcher(None, target_text, recognized).ratio()
+                    is_match = (
+                        target_text == recognized
+                        or ratio > 0.65
+                        or (len(target_text) > 3 and target_text in recognized)
+                        or (len(recognized) > 3 and recognized in target_text)
+                        or (len(target_text) > 2 and (target_text in recognized.split() or recognized in target_text.split()))
+                    )
+                    if is_match:
+                        log(f"[CAPTCHA] Match found: option {idx+1} (ratio={ratio:.2f})")
                         await option.click()
                         await asyncio.sleep(1)
                         # Verify challenge accepted
@@ -716,8 +786,15 @@ class ACLCloudsRenewer:
 
                         log(f"[TURNSTILE] Option {idx+1}: '{recognized}'")
 
-                        if target_text == recognized or (len(target_text) > 2 and (target_text in recognized.split() or recognized in target_text.split())):
-                            log(f"[TURNSTILE] Match found: option {idx+1}")
+                        ratio = difflib.SequenceMatcher(None, target_text, recognized).ratio()
+                        is_match = (
+                            target_text == recognized
+                            or ratio > 0.65
+                            or (len(target_text) > 3 and target_text in recognized)
+                            or (len(recognized) > 3 and recognized in target_text)
+                        )
+                        if is_match:
+                            log(f"[TURNSTILE] Match found: option {idx+1} (ratio={ratio:.2f})")
                             await option.click()
                             await asyncio.sleep(1)
                             if await challenge.is_visible():

@@ -25,12 +25,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0
 
       - name: Install ddddocr from source
-        run: pip install git+https://github.com/sml2h3/ddddocr.git
+        run: |
+          pip install --upgrade pip
+          for i in 1 2 3; do pip install git+https://github.com/sml2h3/ddddocr.git && break || { echo "retry $i/3"; sleep 5; }; done
+          # fallback to PyPI if git fails
+          pip show ddddocr || pip install ddddocr
 
       - name: Install Python dependencies
         run: |
           pip install -r requirements.txt
           playwright install chromium --with-deps
+          playwright install-deps chromium || true
 
       - name: Setup WARP
         uses: fscarmen/warp-on-actions@v1.3
@@ -40,18 +45,18 @@ jobs:
 
       - name: Fix DNS
         run: |
-          sudo systemctl stop systemd-resolved 2>/dev/null || true
-          sudo systemctl disable systemd-resolved 2>/dev/null || true
-          sudo rm -f /etc/resolv.conf
-          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
-          echo "Public IP: $(curl -s --max-time 10 https://api.ipify.org)"
+          echo "nameserver 1.1.1.1" | sudo tee -a /etc/resolv.conf >/dev/null 2>&1 || true
+          echo "nameserver 8.8.8.8" | sudo tee -a /etc/resolv.conf >/dev/null 2>&1 || true
+          echo "DNS check:"
+          cat /etc/resolv.conf || true
+          echo "Public IP: $(curl -s --max-time 10 https://api.ipify.org || echo 'unknown')"
           curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
 
       - name: Restore cookies from cache
         uses: actions/cache/restore@v4
         with:
           path: /tmp/aclclou_cookies
-          key: aclclou-cookies-${{ github.run_id }}-${{ github.run_attempt }}
+          key: aclclou-cookies-v1
           restore-keys: aclclou-cookies-
 
       - name: Run renewal script
@@ -70,7 +75,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: /tmp/aclclou_cookies
-          key: aclclou-cookies-${{ github.run_id }}-${{ github.run_attempt }}
+          key: aclclou-cookies-v1-${{ github.run_id }}
 
       - name: Upload screenshots
         if: always()
