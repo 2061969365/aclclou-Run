@@ -355,6 +355,19 @@ class ACLCloudsRenewer:
             viewport={"width": 1920, "height": 1080},
         )
         self.page = await self.context.new_page()
+        # ── 网络/控制台监听：定位 Cap 续期接口的真实返回 ──
+        try:
+            self.page.on("console", lambda msg: log(f"[CONSOLE][{msg.type}] {(msg.text or '')[:200]}") if any(k in (msg.text or '').lower() for k in ["captcha", "cap.", "renew", "verif", "error", "fail"]) else None)
+            async def _log_resp(resp):
+                try:
+                    url = resp.url.lower()
+                    if any(k in url for k in ["cap.", "captcha", "renew", "challenge", "verify"]):
+                        log(f"[NET][{resp.status}] {resp.url[:150]}")
+                except Exception:
+                    pass
+            self.page.on("response", lambda r: asyncio.ensure_future(_log_resp(r)))
+        except Exception as e:
+            log(f"[BROWSER] listener skip: {e}")
         log("[BROWSER] Started")
 
     async def close_browser(self):
@@ -796,14 +809,18 @@ class ACLCloudsRenewer:
 
             log(f"[TURNSTILE] Anti-bot confirmation dialog detected")
 
-            # 点击复选框（官网改版：文案从 "I am not a robot" 改为 "Verify you're human"）
+            # 点击复选框（官网改版：文案从 "I am not a robot" 改为 "Verify you're human"，
+            # Cap 部件可能是 input/role=checkbox，先找真正的框，避免点到文本行导致误关弹窗）
             checkbox = None
             for sel in [
+                'input[type="checkbox"]',
+                '[role="checkbox"]',
+                '[class*=checkbox]',
+                '[class*=cap-] input',
                 "text=Verify you're human",
                 "text=Verify you are human",
                 "text=I am not a robot",
                 "text=Verify",
-                'input[type="checkbox"]',
             ]:
                 try:
                     loc = page.locator(sel)
@@ -858,15 +875,46 @@ class ACLCloudsRenewer:
                 continue
 
             await asyncio.sleep(2)
+            # 点后即时诊断：复选框状态 + toast/弹窗是否还在（区分验证成功关闭 vs 误点关闭）
+            try:
+                state = await checkbox.evaluate(
+                    """(el) => {
+                        if (el.checked === true) return 'checked';
+                        const a = el.getAttribute ? (el.getAttribute('aria-checked') || el.getAttribute('data-state') || '') : '';
+                        if (a) return 'attr:' + a;
+                        const box = el.closest ? (el.closest('[role=checkbox]') || el.querySelector('[role=checkbox]')) : null;
+                        if (box) return 'role:' + (box.getAttribute('aria-checked') || box.getAttribute('data-state') || 'none');
+                        return 'unknown:' + (el.tagName || '?');
+                    }"""
+                )
+                log(f"[TURNSTILE] post-click checkbox state: {state}")
+            except Exception as e:
+                log(f"[TURNSTILE] post-click state skip: {e}")
+            try:
+                await page.screenshot(path=os.path.join(DEBUG_DIR, f"turnstile_clicked_{i+1}.png"), full_page=False)
+                log(f"[TURNSTILE] post-click screenshot saved (clicked_{i+1})")
+            except Exception:
+                pass
+            try:
+                toast = page.locator('[class*=toast], [class*=Toast], [role="alert"], [class*=notification], [class*=snackbar]')
+                if await toast.count() > 0:
+                    try:
+                        t = (await toast.first.inner_text()).strip()
+                        if t:
+                            log(f"[TURNSTILE] toast/alert: {t[:200]}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             # 检查是否有CAPTCHA挑战出现（与登录页相同结构 + 新版变体）
+            # 注意：server 页 Renew 旁常驻的 captcha_required 只是标记，不是挑战，不列入
             challenge = None
             for sel in [
                 ".auth-captcha-challenge",
                 "[class*=captcha-challenge]",
                 "[class*=Captcha]",
                 "text=/select.*image/i",
-                "text=/captcha_required/i",
             ]:
                 try:
                     loc = page.locator(sel)
