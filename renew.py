@@ -761,18 +761,17 @@ class ACLCloudsRenewer:
             anti_bot = page.locator("text=/Anti-bot confirmation/i")
             if await anti_bot.count() == 0:
                 # 弹窗已消失：若之前见过弹窗，说明复选框已点，不再空转 20 次
+                # Cap  Chancellor：PoW 需要时间，最长等 60s（20 x 3s），同时给成功文案留机会
                 if dialog_seen:
                     post_dismiss_checks += 1
                     if await success_text.count() > 0:
                         log(f"[TURNSTILE] Resolved after dismiss (check {post_dismiss_checks})")
                         return True
-                    # 给成功文案 / 时间更新留 2 次检查机会，然后返回 True 让调用方校验时间
-                    if post_dismiss_checks >= 2:
-                        # 诊断：是否出现 captcha_required（截图证实续期按钮旁有此标记）
+                    if post_dismiss_checks >= 20:
                         try:
                             req = page.locator("text=/captcha_required/i")
                             if await req.count() > 0:
-                                log("[TURNSTILE] NOTE: captcha_required marker present, image captcha may be pending")
+                                log("[TURNSTILE] NOTE: captcha_required marker still present after 60s wait")
                         except Exception:
                             pass
                         log("[TURNSTILE] Dialog dismissed, checkbox done, proceed to result check")
@@ -781,7 +780,8 @@ class ACLCloudsRenewer:
                         except Exception:
                             pass
                         return True
-                    log(f"[TURNSTILE] Dismissed, re-check success ({post_dismiss_checks}/2)...")
+                    if post_dismiss_checks in (1, 5, 10, 15, 20):
+                        log(f"[TURNSTILE] Dismissed, waiting Cap PoW / success ({post_dismiss_checks}/20)...")
                     await asyncio.sleep(3)
                     continue
                 log(f"[TURNSTILE] Attempt {i+1}/{max_attempts}: No Anti-bot dialog, checking success...")
@@ -1312,6 +1312,30 @@ class ACLCloudsRenewer:
                 log("[RENEW] Server renewed successfully text found")
                 result["success"] = True
                 result["message"] = "Renewal successful (via text)"
+
+            # Cap 两步提交：验证通过后可能需要再点一次 Renew 才会真正提交
+            # （截图显示验证后仍停留在 server 页，Renew + captcha_required 并存）
+            if not result["success"]:
+                try:
+                    anti_gone = await self.page.locator("text=/Anti-bot confirmation/i").count() == 0
+                    req = self.page.locator("text=/captcha_required/i")
+                    req_present = await req.count() > 0
+                    if anti_gone and req_present:
+                        log("[RENEW] Try second Renew submit after Cap verified...")
+                        visible2 = await self._find_visible_renew_buttons()
+                        if visible2:
+                            btn2, txt2 = visible2[0]
+                            if await self._click_robust(btn2, f"second:{txt2[:30]}"):
+                                log(f"[RENEW] Clicked second Renew ('{txt2[:60]}')")
+                                await asyncio.sleep(3)
+                                turnstile_ok2 = await self._brute_force_turnstile(self.page)
+                                if not turnstile_ok2:
+                                    log("[RENEW] Second turnstile not resolved, checking anyway...")
+                                if await self.page.locator("text=Server renewed successfully").count() > 0:
+                                    result["success"] = True
+                                    result["message"] = "Renewal successful (via text, 2nd submit)"
+                except Exception as e2:
+                    log(f"[RENEW] second submit skip: {e2}")
 
             await self.page.goto(f"{BASE_URL}/server/{server_id}", wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
