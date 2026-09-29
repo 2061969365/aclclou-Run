@@ -767,13 +767,44 @@ class ACLCloudsRenewer:
 
             log(f"[TURNSTILE] Anti-bot confirmation dialog detected")
 
-            # 点击"I am not a robot"复选框
-            checkbox = page.locator("text=I am not a robot")
-            if await checkbox.count() > 0:
-                box = await checkbox.bounding_box()
+            # 点击复选框（官网改版：文案从 "I am not a robot" 改为 "Verify you're human"）
+            checkbox = None
+            for sel in [
+                "text=Verify you're human",
+                "text=Verify you are human",
+                "text=I am not a robot",
+                "text=Verify",
+                'input[type="checkbox"]',
+            ]:
+                try:
+                    loc = page.locator(sel)
+                    if await loc.count() > 0:
+                        # 取 Anti-bot 弹窗内可见的第一个
+                        for k in range(min(await loc.count(), 5)):
+                            try:
+                                if await loc.nth(k).is_visible():
+                                    checkbox = loc.nth(k)
+                                    log(f"[TURNSTILE] checkbox selector matched: {sel}")
+                                    break
+                            except Exception:
+                                continue
+                        if checkbox is not None:
+                            break
+                except Exception:
+                    continue
+            if checkbox is not None:
+                try:
+                    box = await checkbox.bounding_box()
+                except Exception:
+                    box = None
                 if box:
-                    cx = box["x"] + box["width"] / 2
-                    cy = box["y"] + box["height"] / 2
+                    # 文案行很宽时点左侧复选框位置，而非文本中心
+                    if box["width"] > 100:
+                        cx = box["x"] + 20
+                        cy = box["y"] + box["height"] / 2
+                    else:
+                        cx = box["x"] + box["width"] / 2
+                        cy = box["y"] + box["height"] / 2
                     await page.mouse.move(cx + random.uniform(-3, 3), cy + random.uniform(-3, 3))
                     await asyncio.sleep(random.uniform(0.2, 0.5))
                     await page.mouse.move(cx, cy)
@@ -781,9 +812,16 @@ class ACLCloudsRenewer:
                     await page.mouse.click(cx, cy)
                     log(f"[TURNSTILE] Clicked checkbox attempt {i+1}/{max_attempts} at ({cx:.0f}, {cy:.0f})")
                 else:
-                    log(f"[TURNSTILE] Could not get bounding box")
+                    log(f"[TURNSTILE] Could not get bounding box, try direct click")
+                    try:
+                        await checkbox.click(timeout=5000)
+                    except Exception:
+                        try:
+                            await checkbox.evaluate("(el) => el.click()")
+                        except Exception:
+                            pass
             else:
-                log(f"[TURNSTILE] Attempt {i+1}/{max_attempts}: 'I am not a robot' not found")
+                log(f"[TURNSTILE] Attempt {i+1}/{max_attempts}: human checkbox not found")
                 await asyncio.sleep(3)
                 if await success_text.count() > 0:
                     log(f"[TURNSTILE] Resolved after {i+1} attempts")
@@ -1102,7 +1140,7 @@ class ACLCloudsRenewer:
             # 策略 B：My renewals Tab（新版 UI 已把续期入口移到此 Tab，截图证实）
             if not clicked:
                 try:
-                    tab = self.page.locator('button:has-text("My renewals"), a:has-text("My renewals"), text=My renewals')
+                    tab = self.page.locator('button:has-text("My renewals"), a:has-text("My renewals")')
                     if await tab.count() > 0:
                         try:
                             await tab.first.scroll_into_view_if_needed(timeout=5000)
