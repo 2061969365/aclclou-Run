@@ -352,7 +352,7 @@ class ACLCloudsRenewer:
         )
         self.context = await self.browser.new_context(
             user_agent=USER_AGENT,
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1920, "height": 1080},
         )
         self.page = await self.context.new_page()
         log("[BROWSER] Started")
@@ -890,7 +890,16 @@ class ACLCloudsRenewer:
             texts = await self.page.locator("button").all_inner_texts()
             clean = [re.sub(r"\s+", " ", t).strip() for t in texts]
             clean = [t for t in clean if t]
-            log(f"[RENEW][{where}] buttons({len(clean)}): {clean[:20]}")
+            log(f"[RENEW][{where}] buttons({len(clean)}): {clean}")
+            # 链接也可能是入口（Details/Renew 可能是 <a>）
+            try:
+                links = await self.page.locator("a").all_inner_texts()
+                lclean = [re.sub(r"\s+", " ", t).strip() for t in links]
+                lclean = [t for t in lclean if t][:20]
+                if lclean:
+                    log(f"[RENEW][{where}] links: {lclean}")
+            except Exception:
+                pass
         except Exception as e:
             log(f"[RENEW][{where}] dump buttons skip: {e}")
 
@@ -933,7 +942,8 @@ class ACLCloudsRenewer:
     async def _find_visible_renew_buttons(self):
         """只返回可见的 Renew/Extend 类按钮，避免点到隐藏模板（根因修复）。
         旧代码用 *:has-text(server_id) 会命中隐藏的 client-btn，导致
-        'element is not visible' 超时 30s x3。"""
+        'element is not visible' 超时 30s x3。
+        注意：必须排除 'My renewals' Tab（它包含 Renew 子串但不是续期按钮）。"""
         candidates = self.page.locator(
             'button:has-text("Renew"), button:has-text("Renouveler"), '
             'button:has-text("Extend"), button:has-text("Prolonger"), '
@@ -944,7 +954,7 @@ class ACLCloudsRenewer:
             count = await candidates.count()
         except Exception:
             return visible
-        for i in range(min(count, 20)):
+        for i in range(min(count, 30)):
             try:
                 b = candidates.nth(i)
                 if await b.count() == 0:
@@ -954,10 +964,90 @@ class ACLCloudsRenewer:
                         t = (await b.inner_text()).strip()
                     except Exception:
                         t = ""
+                    tl = re.sub(r"\s+", " ", t).strip().lower()
+                    # 排除导航 Tab：My renewals / My renewal / Mes renouvellements 等
+                    if tl in ("my renewals", "my renewal", "mes renouvellements", "my renews"):
+                        continue
+                    if tl.startswith("my renew"):
+                        continue
                     visible.append((b, t))
             except Exception:
                 continue
         return visible
+
+    async def _open_my_renewals_detail(self, server_id: str) -> bool:
+        """在 My renewals 页点击对应服务的 Details/Actions，进入可续期弹窗或详情。
+        返回是否成功打开了详情（截图证据：ACTIONS 列有 Details 按钮，右侧被截断，需横向滚动）。"""
+        try:
+            # 横向滚动到最右，确保 ACTIONS 列可见（1280 宽视口会截断）
+            try:
+                await self.page.evaluate("window.scrollTo(document.body.scrollWidth, 0)")
+                await asyncio.sleep(1)
+            except Exception:
+                pass
+            # 优先按 service_id 短前缀定位行内的 Details 按钮
+            short = server_id[:8] if len(server_id) >= 8 else server_id
+            row = None
+            for locator_str in [f'tr:has-text("{short}")', f'text={short}']:
+                try:
+                    loc = self.page.locator(locator_str)
+                    if await loc.count() > 0:
+                        row = loc.first
+                        break
+                except Exception:
+                    continue
+            detail_btn = None
+            if row is not None:
+                for sel in [
+                    'button:has-text("Detail")', 'a:has-text("Detail")',
+                    'button:has-text("Action")', 'button:has-text("Manage")',
+                    'button:has-text("操作")', 'button:has-text("详情")',
+                ]:
+                    try:
+                        # 在行祖先容器内查找
+                        container = self.page.locator(f'tr:has-text("{short}")')
+                        if await container.count() > 0:
+                            cand = container.first.locator(sel)
+                            if await cand.count() > 0:
+                                for k in range(min(await cand.count(), 3)):
+                                    if await cand.nth(k).is_visible():
+                                        detail_btn = cand.nth(k)
+                                        break
+                            if detail_btn is not None:
+                                break
+                    except Exception:
+                        continue
+            if detail_btn is None:
+                # 兜底：页面上第一个可见的 Detail 按钮（单服务账号安全）
+                try:
+                    cand = self.page.locator('button:has-text("Detail"), a:has-text("Detail")')
+                    for k in range(min(await cand.count(), 5)):
+                        if await cand.nth(k).is_visible():
+                            detail_btn = cand.nth(k)
+                            break
+                except Exception:
+                    pass
+            if detail_btn is None:
+                log("[RENEW] My renewals detail button not found")
+                return False
+            try:
+                await detail_btn.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass
+            try:
+                await detail_btn.click(timeout=8000)
+            except Exception:
+                try:
+                    await detail_btn.evaluate("(el) => el.click()")
+                except Exception as e:
+                    log(f"[RENEW] detail click failed: {e}")
+                    return False
+            await asyncio.sleep(3)
+            await self._dump_buttons_for_debug("after-detail")
+            return True
+        except Exception as e:
+            log(f"[RENEW] open detail skip: {e}")
+            return False
 
     # ── 续期（暴力点击 Turnstile） ──
     async def renew_server(self, server_id: str, old_remaining_hours: float = -1) -> dict:
@@ -1009,7 +1099,7 @@ class ACLCloudsRenewer:
             else:
                 log("[RENEW] No visible Renew button on list page, try My renewals tab...")
 
-            # 策略 B：My renewals Tab（新版 UI 可能把续期入口移到此 Tab）
+            # 策略 B：My renewals Tab（新版 UI 已把续期入口移到此 Tab，截图证实）
             if not clicked:
                 try:
                     tab = self.page.locator('button:has-text("My renewals"), a:has-text("My renewals"), text=My renewals')
@@ -1033,6 +1123,15 @@ class ACLCloudsRenewer:
                             if await self._click_robust(btn, f"tab:{txt[:30]}"):
                                 clicked = True
                                 log(f"[RENEW] Clicked Renew for {server_id} (My renewals tab: '{txt[:60]}')")
+                        # B2：My renewals 行内 Details -> 弹窗/详情里的真 Renew 按钮
+                        if not clicked:
+                            if await self._open_my_renewals_detail(server_id):
+                                visible = await self._find_visible_renew_buttons()
+                                if visible:
+                                    btn, txt = visible[0]
+                                    if await self._click_robust(btn, f"renewals-detail:{txt[:30]}"):
+                                        clicked = True
+                                        log(f"[RENEW] Clicked Renew for {server_id} (renewals detail: '{txt[:60]}')")
                 except Exception as e:
                     log(f"[RENEW] My renewals tab skip: {e}")
 
