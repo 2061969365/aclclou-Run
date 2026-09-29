@@ -749,6 +749,8 @@ class ACLCloudsRenewer:
     # ── 反机器人验证处理（ACLClouds 自定义验证） ──
     async def _brute_force_turnstile(self, page, max_attempts=20) -> bool:
         log(f"[TURNSTILE] Starting brute force (max {max_attempts} attempts)")
+        dialog_seen = False
+        post_dismiss_checks = 0
 
         for i in range(max_attempts):
             success_text = page.locator("text=Server renewed successfully")
@@ -758,12 +760,39 @@ class ACLCloudsRenewer:
 
             anti_bot = page.locator("text=/Anti-bot confirmation/i")
             if await anti_bot.count() == 0:
+                # 弹窗已消失：若之前见过弹窗，说明复选框已点，不再空转 20 次
+                if dialog_seen:
+                    post_dismiss_checks += 1
+                    if await success_text.count() > 0:
+                        log(f"[TURNSTILE] Resolved after dismiss (check {post_dismiss_checks})")
+                        return True
+                    # 给成功文案 / 时间更新留 2 次检查机会，然后返回 True 让调用方校验时间
+                    if post_dismiss_checks >= 2:
+                        # 诊断：是否出现 captcha_required（截图证实续期按钮旁有此标记）
+                        try:
+                            req = page.locator("text=/captcha_required/i")
+                            if await req.count() > 0:
+                                log("[TURNSTILE] NOTE: captcha_required marker present, image captcha may be pending")
+                        except Exception:
+                            pass
+                        log("[TURNSTILE] Dialog dismissed, checkbox done, proceed to result check")
+                        try:
+                            await page.screenshot(path=os.path.join(DEBUG_DIR, "turnstile_after_dismiss.png"), full_page=False)
+                        except Exception:
+                            pass
+                        return True
+                    log(f"[TURNSTILE] Dismissed, re-check success ({post_dismiss_checks}/2)...")
+                    await asyncio.sleep(3)
+                    continue
                 log(f"[TURNSTILE] Attempt {i+1}/{max_attempts}: No Anti-bot dialog, checking success...")
                 await asyncio.sleep(3)
                 if await success_text.count() > 0:
                     log(f"[TURNSTILE] Resolved after {i+1} attempts")
                     return True
                 continue
+
+            dialog_seen = True
+            post_dismiss_checks = 0
 
             log(f"[TURNSTILE] Anti-bot confirmation dialog detected")
 
@@ -830,14 +859,48 @@ class ACLCloudsRenewer:
 
             await asyncio.sleep(2)
 
-            # 检查是否有CAPTCHA挑战出现（与登录页相同结构）
-            challenge = page.locator(".auth-captcha-challenge")
-            if await challenge.is_visible():
+            # 检查是否有CAPTCHA挑战出现（与登录页相同结构 + 新版变体）
+            challenge = None
+            for sel in [
+                ".auth-captcha-challenge",
+                "[class*=captcha-challenge]",
+                "[class*=Captcha]",
+                "text=/select.*image/i",
+                "text=/captcha_required/i",
+            ]:
+                try:
+                    loc = page.locator(sel)
+                    if await loc.count() > 0:
+                        try:
+                            if await loc.first.is_visible():
+                                challenge = page.locator(".auth-captcha-challenge") if await page.locator(".auth-captcha-challenge").count() > 0 else loc
+                                log(f"[TURNSTILE] Challenge marker detected via: {sel}")
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            if challenge is not None:
+                try:
+                    visible = await challenge.first.is_visible()
+                except Exception:
+                    visible = True
+                if not visible:
+                    challenge = None
+            if challenge is not None:
                 log(f"[TURNSTILE] CAPTCHA challenge detected, solving...")
                 for ocr_attempt in range(1, 6):
                     prompt_elem = page.locator(".auth-captcha-prompt strong")
                     if await prompt_elem.count() == 0:
-                        log("[TURNSTILE] No CAPTCHA prompt found")
+                        log("[TURNSTILE] No CAPTCHA prompt found (old selector), dump for new UI")
+                        try:
+                            await self._save_html("turnstile_captcha_unknown")
+                            body = await page.content()
+                            m = re.search(r"(captcha[^<]{0,120})", body, re.I)
+                            if m:
+                                log(f"[TURNSTILE] captcha context: {m.group(1)[:150]}")
+                        except Exception as e:
+                            log(f"[TURNSTILE] dump skip: {e}")
                         break
 
                     target_text = (await prompt_elem.inner_text()).strip().lower()
