@@ -536,25 +536,77 @@ class ACLCloudsRenewer:
                 "[class*=countdown]",
                 "[class*=expiry]",
                 "text=Remaining",
+                "text=Expires in",
                 "text=Expires",
                 "text=到期",
             ]:
                 elem = self.page.locator(selector)
                 if await elem.count() > 0:
-                    time_text = await elem.first.inner_text()
-                    break
+                    try:
+                        time_text = await elem.first.inner_text()
+                    except Exception:
+                        continue
+                    if time_text and time_text.strip():
+                        break
 
             if time_text:
                 log(f"[STATUS] Raw time text: '{time_text}'")
                 hours = self._parse_remaining_hours(time_text)
                 result["remaining_hours"] = hours
 
+            # ── Fallback: dashboard/projects 兜底（官网改版后 /server 页可能取不到时间）──
+            # 截图证据：/server 解析为 Expired(-1)，但 dashboard 显示 Expires in 14h / Active
+            if result["remaining_hours"] < 0:
+                try:
+                    await self.page.goto(f"{BASE_URL}/dashboard/projects", wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(2)
+                    dash_text = ""
+                    for selector in [
+                        "text=Expires in",
+                        "text=Time remaining",
+                        "text=Remaining",
+                        "text=Effective date",
+                        "text=Expiry",
+                    ]:
+                        elem = self.page.locator(selector)
+                        if await elem.count() > 0:
+                            try:
+                                dash_text = await elem.first.inner_text()
+                            except Exception:
+                                continue
+                            if dash_text and dash_text.strip():
+                                break
+                    if dash_text:
+                        log(f"[STATUS] Dashboard fallback raw: '{dash_text}'")
+                        hours = self._parse_remaining_hours(dash_text)
+                        if hours >= 0:
+                            result["remaining_hours"] = hours
+                    # Expiry 日期兜底：如 09/30/2026 / Effective date: 09/30/2026
+                    if result["remaining_hours"] < 0:
+                        try:
+                            body = await self.page.content()
+                            m = re.search(r"(?:Effective date|Expiry|Expires?)[^\d]*(\d{1,2})/(\d{1,2})/(\d{4})", body, re.I)
+                            if m:
+                                from datetime import datetime as _dt
+                                exp = _dt(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+                                delta_h = (exp - _dt.utcnow()).total_seconds() / 3600
+                                if delta_h > -72:  # 过期不久也接受，用于判断
+                                    result["remaining_hours"] = max(delta_h, 0.0)
+                                    log(f"[STATUS] Parsed expiry date {m.group(0).strip()} -> {result['remaining_hours']:.1f}h")
+                        except Exception as e2:
+                            log(f"[STATUS] Expiry date parse skip: {e2}")
+                except Exception as e1:
+                    log(f"[STATUS] Dashboard fallback skip: {e1}")
+
             power_status = None
             online_indicators = [
                 ".status-online",
                 "text=Online",
                 "text=En ligne",
+                "text=Active",
+                "text=Running",
                 "[data-status=online]",
+                "[data-status=active]",
             ]
             for sel in online_indicators:
                 elem = self.page.locator(sel)
@@ -564,7 +616,7 @@ class ACLCloudsRenewer:
 
             if not result["is_online"]:
                 power_status = await self.page.evaluate("""() => {
-                    const knownStates = ['Offline', 'Online', 'Running', 'Starting', 'Stopping', 'Restarting'];
+                    const knownStates = ['Offline', 'Online', 'Running', 'Active', 'Starting', 'Stopping', 'Restarting'];
                     const allEls = Array.from(document.querySelectorAll('span, div, p, button'));
                     for (const el of allEls) {
                         if (el.children.length > 0) continue;
@@ -575,7 +627,7 @@ class ACLCloudsRenewer:
                     }
                     return null;
                 }""")
-                if power_status in ("Online", "Running", "Starting", "Restarting"):
+                if power_status in ("Online", "Running", "Active", "Starting", "Restarting"):
                     result["is_online"] = True
 
             offline_indicators = [
@@ -832,6 +884,81 @@ class ACLCloudsRenewer:
         log("[TURNSTILE] Max attempts reached, may not have resolved")
         return False
 
+    # ── 续期辅助：诊断 + 稳健点击 ──
+    async def _dump_buttons_for_debug(self, where: str):
+        try:
+            texts = await self.page.locator("button").all_inner_texts()
+            clean = [re.sub(r"\s+", " ", t).strip() for t in texts]
+            clean = [t for t in clean if t]
+            log(f"[RENEW][{where}] buttons({len(clean)}): {clean[:20]}")
+        except Exception as e:
+            log(f"[RENEW][{where}] dump buttons skip: {e}")
+
+    async def _save_html(self, name: str):
+        try:
+            os.makedirs(DEBUG_DIR, exist_ok=True)
+            path = os.path.join(DEBUG_DIR, f"{name}.html")
+            html = await self.page.content()
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)
+            log(f"[DEBUG] HTML saved: {path} ({len(html)} bytes)")
+        except Exception as e:
+            log(f"[DEBUG] HTML save failed: {e}")
+
+    async def _click_robust(self, btn, label: str) -> bool:
+        """可见性过滤 + 滚动 + 普通点击 + JS 兜底。返回是否点击成功。"""
+        try:
+            try:
+                await btn.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+            try:
+                await btn.click(timeout=10000)
+                return True
+            except PlaywrightTimeout as e1:
+                log(f"[RENEW] normal click timeout({label}), try JS click: {str(e1)[:120]}")
+            # JS 兜底：隐藏元素 / 被遮挡时仍可触发
+            try:
+                await btn.evaluate("(el) => el.click()")
+                await asyncio.sleep(1)
+                return True
+            except Exception as e2:
+                log(f"[RENEW] JS click failed({label}): {e2}")
+                return False
+        except Exception as e:
+            log(f"[RENEW] click failed({label}): {e}")
+            return False
+
+    async def _find_visible_renew_buttons(self):
+        """只返回可见的 Renew/Extend 类按钮，避免点到隐藏模板（根因修复）。
+        旧代码用 *:has-text(server_id) 会命中隐藏的 client-btn，导致
+        'element is not visible' 超时 30s x3。"""
+        candidates = self.page.locator(
+            'button:has-text("Renew"), button:has-text("Renouveler"), '
+            'button:has-text("Extend"), button:has-text("Prolonger"), '
+            'button:has-text("Renewal"), a:has-text("Renew")'
+        )
+        visible = []
+        try:
+            count = await candidates.count()
+        except Exception:
+            return visible
+        for i in range(min(count, 20)):
+            try:
+                b = candidates.nth(i)
+                if await b.count() == 0:
+                    continue
+                if await b.is_visible():
+                    try:
+                        t = (await b.inner_text()).strip()
+                    except Exception:
+                        t = ""
+                    visible.append((b, t))
+            except Exception:
+                continue
+        return visible
+
     # ── 续期（暴力点击 Turnstile） ──
     async def renew_server(self, server_id: str, old_remaining_hours: float = -1) -> dict:
         result = {
@@ -844,7 +971,11 @@ class ACLCloudsRenewer:
         name = f"renew_{server_id}_{int(time.time())}"
 
         try:
-            await self.page.goto(f"{BASE_URL}/dashboard/projects", wait_until="networkidle", timeout=60000)
+            await self.page.goto(f"{BASE_URL}/dashboard/projects", wait_until="domcontentloaded", timeout=60000)
+            try:
+                await self.page.locator("text=Manage my services").first.wait_for(state="visible", timeout=15000)
+            except Exception:
+                pass
             await asyncio.sleep(random.uniform(2, 3))
 
             await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -852,7 +983,7 @@ class ACLCloudsRenewer:
 
             await self.page.evaluate("""() => {
                 const btns = [...document.querySelectorAll('button')];
-                const closeBtn = btns.find(b => b.innerText.trim() === 'Close');
+                const closeBtn = btns.find(b => (b.innerText || '').trim() === 'Close');
                 if (closeBtn) closeBtn.click();
             }""")
             await asyncio.sleep(2)
@@ -864,24 +995,112 @@ class ACLCloudsRenewer:
                 result["message"] = "Renewal not yet available (within window)"
                 return result
 
-            renew_btn = self.page.locator(
-                f'*:has-text("{server_id}"):has(button:has-text("Renew"))'
-                ' button:has-text("Renew")'
-            )
-            if await renew_btn.count() == 0:
-                renew_btn = self.page.locator(
-                    'button:has-text("Renew"), button:has-text("Renouveler"), '
-                    'button:has-text("Extend"), button:has-text("Prolonger")'
-                )
+            clicked = False
 
-            if await renew_btn.count() == 0:
-                result["message"] = "No Renew button found"
+            # 策略 A：列表页可见 Renew 按钮（官网改版后列表页已无 Renew，需过滤可见元素）
+            await self._dump_buttons_for_debug("list")
+            visible = await self._find_visible_renew_buttons()
+            if visible:
+                log(f"[RENEW] Found {len(visible)} visible renew buttons on list page")
+                btn, txt = visible[0]
+                if await self._click_robust(btn, f"list:{txt[:30]}"):
+                    clicked = True
+                    log(f"[RENEW] Clicked Renew for {server_id} (list page: '{txt[:60]}')")
+            else:
+                log("[RENEW] No visible Renew button on list page, try My renewals tab...")
+
+            # 策略 B：My renewals Tab（新版 UI 可能把续期入口移到此 Tab）
+            if not clicked:
+                try:
+                    tab = self.page.locator('button:has-text("My renewals"), a:has-text("My renewals"), text=My renewals')
+                    if await tab.count() > 0:
+                        try:
+                            await tab.first.scroll_into_view_if_needed(timeout=5000)
+                        except Exception:
+                            pass
+                        try:
+                            await tab.first.click(timeout=8000)
+                        except Exception:
+                            try:
+                                await tab.first.evaluate("(el) => el.click()")
+                            except Exception:
+                                pass
+                        await asyncio.sleep(3)
+                        await self._dump_buttons_for_debug("my-renewals")
+                        visible = await self._find_visible_renew_buttons()
+                        if visible:
+                            btn, txt = visible[0]
+                            if await self._click_robust(btn, f"tab:{txt[:30]}"):
+                                clicked = True
+                                log(f"[RENEW] Clicked Renew for {server_id} (My renewals tab: '{txt[:60]}')")
+                except Exception as e:
+                    log(f"[RENEW] My renewals tab skip: {e}")
+
+            # 策略 C：View service details 详情页/弹窗（截图显示列表页只有 View/Cancel/Invoices/Support）
+            if not clicked:
+                try:
+                    detail_btn = self.page.locator(
+                        'button:has-text("View service details"), button:has-text("View details"), '
+                        'a:has-text("View service details")'
+                    )
+                    if await detail_btn.count() > 0:
+                        for i in range(min(await detail_btn.count(), 3)):
+                            try:
+                                b = detail_btn.nth(i)
+                                if not await b.is_visible():
+                                    continue
+                                try:
+                                    await b.scroll_into_view_if_needed(timeout=5000)
+                                except Exception:
+                                    pass
+                                try:
+                                    await b.click(timeout=8000)
+                                except Exception:
+                                    await b.evaluate("(el) => el.click()")
+                                await asyncio.sleep(3)
+                                await self._dump_buttons_for_debug(f"detail-{i}")
+                                visible = await self._find_visible_renew_buttons()
+                                if visible:
+                                    btn, txt = visible[0]
+                                    if await self._click_robust(btn, f"detail:{txt[:30]}"):
+                                        clicked = True
+                                        log(f"[RENEW] Clicked Renew for {server_id} (detail page: '{txt[:60]}')")
+                                        break
+                                # 详情页可能是新页面/弹窗，找不到则返回列表继续
+                                try:
+                                    await self.page.go_back(timeout=10000)
+                                    await asyncio.sleep(2)
+                                except Exception:
+                                    await self.page.goto(f"{BASE_URL}/dashboard/projects", wait_until="domcontentloaded", timeout=30000)
+                                    await asyncio.sleep(2)
+                            except Exception as e3:
+                                log(f"[RENEW] detail candidate {i} skip: {e3}")
+                                continue
+                except Exception as e:
+                    log(f"[RENEW] detail page skip: {e}")
+
+            # 策略 D：直接 /server/{id} 页（旧版续期按钮可能仍在此页）
+            if not clicked:
+                try:
+                    await self.page.goto(f"{BASE_URL}/server/{server_id}", wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(3)
+                    await self._dump_buttons_for_debug("server-page")
+                    visible = await self._find_visible_renew_buttons()
+                    if visible:
+                        btn, txt = visible[0]
+                        if await self._click_robust(btn, f"server:{txt[:30]}"):
+                            clicked = True
+                            log(f"[RENEW] Clicked Renew for {server_id} (server page: '{txt[:60]}')")
+                except Exception as e:
+                    log(f"[RENEW] server page skip: {e}")
+
+            if not clicked:
+                result["message"] = "No visible Renew button found (list/My renewals/detail/server all tried)"
                 log(f"[RENEW] {result['message']} for {server_id}")
-                await save_screenshot(name, self.page)
+                await save_screenshot(f"renew_error_{server_id}", self.page)
+                await self._save_html(f"renew_error_{server_id}")
                 return result
 
-            await renew_btn.first.click()
-            log(f"[RENEW] Clicked Renew for {server_id}")
             await asyncio.sleep(random.uniform(2, 3))
 
             turnstile_ok = await self._brute_force_turnstile(self.page)
@@ -924,6 +1143,10 @@ class ACLCloudsRenewer:
             result["message"] = f"Error: {e}"
             log(f"[RENEW] Error: {e}")
             await save_screenshot(f"renew_error_{server_id}", self.page)
+            try:
+                await self._save_html(f"renew_error_{server_id}")
+            except Exception:
+                pass
 
         return result
 

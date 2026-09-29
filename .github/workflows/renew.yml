@@ -84,6 +84,7 @@ jobs:
           name: screenshots-${{ github.run_id }}
           path: /tmp/aclclou_debug/
           retention-days: 7
+          if-no-files-found: ignore
 
       - name: Notify via Telegram
         if: always()
@@ -91,6 +92,10 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "Telegram secrets not set, skip notify"
+            exit 0
+          fi
           STATUS="${{ job.status }}"
           if [ "$STATUS" = "success" ]; then
             MSG="✅ ACLClouds renewal completed successfully"
