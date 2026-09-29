@@ -363,6 +363,13 @@ class ACLCloudsRenewer:
                     url = resp.url.lower()
                     if any(k in url for k in ["cap.", "captcha", "renew", "challenge", "verify"]):
                         log(f"[NET][{resp.status}] {resp.url[:150]}")
+                    # 续期接口：无论成功失败都记录正文，403 原因全靠它
+                    if "upgrade/renew" in url:
+                        try:
+                            body = await resp.body()
+                            log(f"[API][{resp.status}] renew resp: {body[:500]}")
+                        except Exception as e:
+                            log(f"[API][{resp.status}] renew body skip: {e}")
                 except Exception:
                     pass
             self.page.on("response", lambda r: asyncio.ensure_future(_log_resp(r)))
