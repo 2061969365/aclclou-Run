@@ -566,8 +566,10 @@ class ACLCloudsRenewer:
                         time_text = await elem.first.inner_text()
                     except Exception:
                         continue
-                    if time_text and time_text.strip():
+                    # 必须含数字才接受：排除 "EXPIRY" 表头等误匹配（21:32 误报教训）
+                    if time_text and time_text.strip() and re.search(r"\d", time_text):
                         break
+                    time_text = ""
 
             if time_text:
                 log(f"[STATUS] Raw time text: '{time_text}'")
@@ -585,8 +587,6 @@ class ACLCloudsRenewer:
                         "text=Expires in",
                         "text=Time remaining",
                         "text=Remaining",
-                        "text=Effective date",
-                        "text=Expiry",
                     ]:
                         elem = self.page.locator(selector)
                         if await elem.count() > 0:
@@ -594,25 +594,33 @@ class ACLCloudsRenewer:
                                 dash_text = await elem.first.inner_text()
                             except Exception:
                                 continue
-                            if dash_text and dash_text.strip():
+                            if dash_text and dash_text.strip() and re.search(r"\d", dash_text):
                                 break
+                            dash_text = ""
                     if dash_text:
                         log(f"[STATUS] Dashboard fallback raw: '{dash_text}'")
                         hours = self._parse_remaining_hours(dash_text)
                         if hours >= 0:
                             result["remaining_hours"] = hours
-                    # Expiry 日期兜底：如 09/30/2026 / Effective date: 09/30/2026
+                    # Expiry 日期兜底：全局搜所有 MM/DD/YYYY，取最晚的未来日期
+                    # （旧正则要求日期紧跟 Expiry 关键字，会被 UUID 中的数字截断而失败）
                     if result["remaining_hours"] < 0:
                         try:
                             body = await self.page.content()
-                            m = re.search(r"(?:Effective date|Expiry|Expires?)[^\d]*(\d{1,2})/(\d{1,2})/(\d{4})", body, re.I)
-                            if m:
-                                from datetime import datetime as _dt
-                                exp = _dt(int(m.group(3)), int(m.group(1)), int(m.group(2)))
-                                delta_h = (exp - _dt.utcnow()).total_seconds() / 3600
-                                if delta_h > -72:  # 过期不久也接受，用于判断
-                                    result["remaining_hours"] = max(delta_h, 0.0)
-                                    log(f"[STATUS] Parsed expiry date {m.group(0).strip()} -> {result['remaining_hours']:.1f}h")
+                            from datetime import datetime as _dt
+                            now = _dt.utcnow()
+                            best = None
+                            for m in re.finditer(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", body):
+                                try:
+                                    exp = _dt(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+                                except ValueError:
+                                    continue
+                                delta_h = (exp - now).total_seconds() / 3600
+                                if delta_h > -72 and (best is None or delta_h > best[0]):
+                                    best = (delta_h, m.group(0))
+                            if best is not None:
+                                result["remaining_hours"] = max(best[0], 0.0)
+                                log(f"[STATUS] Parsed expiry date {best[1]} -> {result['remaining_hours']:.1f}h")
                         except Exception as e2:
                             log(f"[STATUS] Expiry date parse skip: {e2}")
                 except Exception as e1:
@@ -1564,6 +1572,11 @@ async def main():
 
                 if renew_result["success"]:
                     STATS["renewals"] += 1
+                elif "No visible Renew button" in renew_result.get("message", "") and status["is_online"]:
+                    # 服务器在线但找不到续期入口 = 暂无需续期（21:32 误报教训：
+                    # 真正过期的服务器能解析出 0h 而不会走此分支）
+                    STATS["skipped"] += 1
+                    log(f"[MAIN] Server {sid} online with no Renew entry, treat as skipped (not failure)")
                 else:
                     STATS["failures"] += 1
 
