@@ -257,10 +257,13 @@ class CaptchaSolver:
                         s = q(inner);
                         if (/true|checked/i.test(s)) return 'checked:' + s;
                     }
-                    return 'unverified:' + ((el.innerText || '').trim().slice(0, 60));
+                    // 注意：前缀必须用 pending（"unverified" 含 "verified" 子串会导致误判通过）
+                    return 'pending:' + ((el.innerText || '').trim().slice(0, 60));
                 }""")
-                if isinstance(state, str) and (state.startswith("checked") or "verified" in state.lower()):
-                    log(f"[CAPTCHA] Cap verified ({state[:60]})")
+                s = state.lower() if isinstance(state, str) else ""
+                # "verified" 必须排除 "unverified"（子串误判会导致没验证完就点 Sign in）
+                if s.startswith("checked") or ("verified" in s and "unverified" not in s):
+                    log(f"[CAPTCHA] Cap verified ({str(state)[:60]})")
                     return True
                 if round in (1, 5, 10, 15):
                     log(f"[CAPTCHA] waiting Cap ({round}/15): {str(state)[:80]}")
@@ -1517,6 +1520,11 @@ class ACLCloudsRenewer:
                 result["new_remaining"] = fmt_hours(new_hours)
                 if result["success"]:
                     result["message"] = f"Renewal successful (new={fmt_hours(new_hours)})"
+                elif new_hours >= 48:
+                    # 旧值未知但新值健康（≥48h）：续期 evidentemente 生效（或服务器本就健康），
+                    # 判成功以省掉两次无用重试（10-07 实证：Expired→95h，第 1 次点击已生效）
+                    result["success"] = True
+                    result["message"] = f"Renewal successful (new={fmt_hours(new_hours)}, inferred)"
                 else:
                     result["message"] = f"Renewal result unknown (new={fmt_hours(new_hours)})"
 
