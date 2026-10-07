@@ -154,8 +154,8 @@ def load_cookies(email: str) -> list | None:
             return None
         with open(path, "r") as f:
             data = json.load(f)
-        if time.time() - data.get("saved_at", 0) > 86400 * 7:
-            log("[COOKIE] Expired (>7 days)")
+        if time.time() - data.get("saved_at", 0) > 86400 * 30:
+            log("[COOKIE] Expired (>30 days)")
             return None
         log(f"[COOKIE] Loaded: {path}")
         return data.get("cookies")
@@ -171,16 +171,112 @@ class CaptchaSolver:
     def __init__(self):
         self.ocr = ddddocr.DdddOcr(show_ad=False)
 
-    async def solve(self, page, max_retries=5) -> bool:
-        checkbox = page.locator(".auth-captcha-checkbox")
-        if await checkbox.count() == 0:
-            # 兼容：有些版本直接显示 Verified，无需点击
+    async def _find_cap_checkbox(self, page):
+        """新版登录页/续期弹窗的 Cap 内嵌复选框（2026-10 官网改版：旧 .auth-captcha-* 已下线）。
+        返回第一个可见候选，找不到返回 None。"""
+        for sel in [
+            'input[type="checkbox"]',
+            '[role="checkbox"]',
+            "text=Verify you're human",
+            "text=Verify you are human",
+            "text=I am not a robot",
+        ]:
+            try:
+                loc = page.locator(sel)
+                for k in range(min(await loc.count(), 8)):
+                    try:
+                        el = loc.nth(k)
+                        if await el.is_visible():
+                            log(f"[CAPTCHA] Cap checkbox matched: {sel}")
+                            return el
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return None
+
+    async def _solve_cap(self, page) -> bool:
+        """点击 Cap 复选框并等待验证通过。返回 True 即允许继续点 Sign in（服务端会最终校验）。"""
+        # 兼容：有些版本直接显示 Verified，无需点击
+        try:
             verified = page.locator("text=Verified")
             if await verified.count() > 0 and await verified.first.is_visible():
                 log("[CAPTCHA] Already verified without checkbox")
                 return True
+        except Exception:
+            pass
+
+        cap = await self._find_cap_checkbox(page)
+        if cap is None:
             log("[CAPTCHA] No checkbox found")
             return False
+
+        # 人性化点击：行级元素很宽时点左侧框体位置
+        try:
+            box = await cap.bounding_box()
+        except Exception:
+            box = None
+        try:
+            if box:
+                if box["width"] > 100:
+                    cx = box["x"] + 20
+                    cy = box["y"] + box["height"] / 2
+                else:
+                    cx = box["x"] + box["width"] / 2 + random.uniform(-3, 3)
+                    cy = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+                await page.mouse.move(cx, cy)
+                await asyncio.sleep(random.uniform(0.2, 0.5))
+                await page.mouse.click(cx, cy)
+            else:
+                await cap.click(timeout=5000)
+        except Exception:
+            try:
+                await cap.evaluate("(el) => el.click()")
+            except Exception:
+                pass
+        log("[CAPTCHA] Clicked Cap checkbox, waiting for verification...")
+
+        for round in range(1, 16):
+            await asyncio.sleep(2)
+            try:
+                v = page.locator("text=Verified")
+                if await v.count() > 0 and await v.first.is_visible():
+                    log("[CAPTCHA] Cap verified (Verified text)")
+                    return True
+            except Exception:
+                pass
+            try:
+                state = await cap.evaluate("""(el) => {
+                    if (el.checked === true) return 'checked';
+                    const q = (n) => n ? (n.getAttribute('aria-checked') || n.getAttribute('data-state') || '') : '';
+                    let s = q(el);
+                    if (/true|checked/i.test(s)) return 'checked:' + s;
+                    const inner = el.querySelector ? el.querySelector('input[type=checkbox],[role=checkbox]') : null;
+                    if (inner) {
+                        if (inner.checked === true) return 'checked:inner';
+                        s = q(inner);
+                        if (/true|checked/i.test(s)) return 'checked:' + s;
+                    }
+                    return 'unverified:' + ((el.innerText || '').trim().slice(0, 60));
+                }""")
+                if isinstance(state, str) and (state.startswith("checked") or "verified" in state.lower()):
+                    log(f"[CAPTCHA] Cap verified ({state[:60]})")
+                    return True
+                if round in (1, 5, 10, 15):
+                    log(f"[CAPTCHA] waiting Cap ({round}/15): {str(state)[:80]}")
+            except Exception as e:
+                if round in (1, 5, 10, 15):
+                    log(f"[CAPTCHA] state check skip ({round}/15): {str(e)[:100]}")
+
+        # 超时也放行：Sign in 时服务端会最终校验，login() 还有重试
+        log("[CAPTCHA] Cap state unclear after 30s, proceed to Sign in anyway")
+        return True
+
+    async def solve(self, page, max_retries=5) -> bool:
+        checkbox = page.locator(".auth-captcha-checkbox")
+        if await checkbox.count() == 0:
+            # 旧图片验证码已下线，走 Cap 流程
+            return await self._solve_cap(page)
 
         # 已是 Verified 状态则直接成功
         try:
