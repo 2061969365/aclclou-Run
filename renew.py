@@ -97,7 +97,9 @@ async def save_screenshot(name: str, page):
 
 
 def fmt_hours(hours: float) -> str:
-    if hours <= 0:
+    if hours < 0:
+        return "unknown"
+    if hours == 0:
         return "Expired"
     if hours < 1:
         return f"{int(hours * 60)} min"
@@ -175,6 +177,10 @@ class CaptchaSolver:
         """新版登录页/续期弹窗的 Cap 内嵌复选框（2026-10 官网改版：旧 .auth-captcha-* 已下线）。
         返回第一个可见候选，找不到返回 None。"""
         for sel in [
+            ".captcha-trigger",
+            "cap-widget",
+            "[part=checkbox]",
+            ".checkbox",
             'input[type="checkbox"]',
             '[role="checkbox"]',
             "text=Verify you're human",
@@ -195,16 +201,31 @@ class CaptchaSolver:
                 continue
         return None
 
+    async def _cap_solved(self, page) -> bool:
+        """Cap 验证完成判定：新版 Cap 成功文案是 You're human（不是 Verified）。"""
+        for sel in [
+            'cap-widget [data-state="done"]',
+            '.captcha[data-state="done"]',
+            ".auth-captcha-box.verified",
+            'text="Verified"',
+            "text=You're human",
+            'text="Vérifié"',
+        ]:
+            try:
+                loc = page.locator(sel)
+                for k in range(min(await loc.count(), 5)):
+                    if await loc.nth(k).is_visible():
+                        return True
+            except Exception:
+                continue
+        return False
+
     async def _solve_cap(self, page) -> bool:
         """点击 Cap 复选框并等待验证通过。返回 True 即允许继续点 Sign in（服务端会最终校验）。"""
         # 兼容：有些版本直接显示 Verified，无需点击
-        try:
-            verified = page.locator("text=Verified")
-            if await verified.count() > 0 and await verified.first.is_visible():
-                log("[CAPTCHA] Already verified without checkbox")
-                return True
-        except Exception:
-            pass
+        if await self._cap_solved(page):
+            log("[CAPTCHA] Already verified without checkbox")
+            return True
 
         cap = await self._find_cap_checkbox(page)
         if cap is None:
@@ -238,13 +259,9 @@ class CaptchaSolver:
 
         for round in range(1, 16):
             await asyncio.sleep(2)
-            try:
-                v = page.locator("text=Verified")
-                if await v.count() > 0 and await v.first.is_visible():
-                    log("[CAPTCHA] Cap verified (Verified text)")
-                    return True
-            except Exception:
-                pass
+            if await self._cap_solved(page):
+                log("[CAPTCHA] Cap verified")
+                return True
             try:
                 state = await cap.evaluate("""(el) => {
                     if (el.checked === true) return 'checked';
@@ -437,6 +454,7 @@ class ACLCloudsRenewer:
         self.logged_in = False
         self.pw = None
         self.server_ids = []
+        self._renew_api_status = None
 
     async def start_browser(self):
         self.pw = await async_playwright().start()
@@ -464,6 +482,7 @@ class ACLCloudsRenewer:
                         log(f"[NET][{resp.status}] {resp.url[:150]}")
                     # 续期接口：无论成功失败都记录正文，403 原因全靠它
                     if "upgrade/renew" in url:
+                        self._renew_api_status = resp.status
                         try:
                             body = await resp.body()
                             log(f"[API][{resp.status}] renew resp: {body[:500]}")
@@ -880,17 +899,26 @@ class ACLCloudsRenewer:
         post_dismiss_checks = 0
 
         for i in range(max_attempts):
+            if self._renew_api_status and 200 <= self._renew_api_status < 300:
+                log(f"[TURNSTILE] Renewal API succeeded (HTTP {self._renew_api_status})")
+                return True
+
             success_text = page.locator("text=Server renewed successfully")
             if await success_text.count() > 0:
                 log(f"[TURNSTILE] Already resolved, skip clicking")
                 return True
 
-            anti_bot = page.locator("text=/Anti-bot confirmation/i")
+            anti_bot = page.get_by_text(
+                re.compile(r"anti-bot confirmation|confirmation anti-robot", re.I)
+            )
             if await anti_bot.count() == 0:
                 # 弹窗已消失：若之前见过弹窗，说明复选框已点，不再空转 20 次
-                # Cap  Chancellor：PoW 需要时间，最长等 60s（20 x 3s），同时给成功文案留机会
+                # Cap 验证需要时间，最长等 60s（20 x 3s），同时给成功文案/接口留机会
                 if dialog_seen:
                     post_dismiss_checks += 1
+                    if self._renew_api_status and 200 <= self._renew_api_status < 300:
+                        log(f"[TURNSTILE] Renewal API succeeded (HTTP {self._renew_api_status})")
+                        return True
                     if await success_text.count() > 0:
                         log(f"[TURNSTILE] Resolved after dismiss (check {post_dismiss_checks})")
                         return True
@@ -924,9 +952,22 @@ class ACLCloudsRenewer:
             log(f"[TURNSTILE] Anti-bot confirmation dialog detected")
 
             # 点击复选框（官网改版：文案从 "I am not a robot" 改为 "Verify you're human"，
-            # Cap 部件可能是 input/role=checkbox，先找真正的框，避免点到文本行导致误关弹窗）
+            # Cap 真正可点的是 shadow DOM 里的 .captcha-trigger / cap-widget）
+            dialog = page.locator(
+                '[role="dialog"]:has(cap-widget), '
+                '[role="dialog"]:has-text("Anti-bot confirmation"), '
+                '[role="dialog"]:has-text("Confirmation anti-robot")'
+            )
+            try:
+                scope = dialog.first if await dialog.count() > 0 else page
+            except Exception:
+                scope = page
             checkbox = None
             for sel in [
+                ".captcha-trigger",
+                "cap-widget",
+                "[part=checkbox]",
+                ".checkbox",
                 'input[type="checkbox"]',
                 '[role="checkbox"]',
                 '[class*=checkbox]',
@@ -937,7 +978,7 @@ class ACLCloudsRenewer:
                 "text=Verify",
             ]:
                 try:
-                    loc = page.locator(sel)
+                    loc = scope.locator(sel)
                     if await loc.count() > 0:
                         # 取 Anti-bot 弹窗内可见的第一个
                         for k in range(min(await loc.count(), 5)):
@@ -989,6 +1030,9 @@ class ACLCloudsRenewer:
                 continue
 
             await asyncio.sleep(2)
+            if self._renew_api_status and 200 <= self._renew_api_status < 300:
+                log(f"[TURNSTILE] Renewal API succeeded (HTTP {self._renew_api_status})")
+                return True
             # 点后即时诊断：复选框状态 + toast/弹窗是否还在（区分验证成功关闭 vs 误点关闭）
             try:
                 state = await checkbox.evaluate(
@@ -1141,6 +1185,9 @@ class ACLCloudsRenewer:
             if await anti_bot.count() == 0:
                 log(f"[TURNSTILE] Anti-bot dialog dismissed")
                 await asyncio.sleep(2)
+                if self._renew_api_status and 200 <= self._renew_api_status < 300:
+                    log(f"[TURNSTILE] Renewal API succeeded (HTTP {self._renew_api_status})")
+                    return True
                 if await success_text.count() > 0:
                     return True
 
@@ -1202,40 +1249,65 @@ class ACLCloudsRenewer:
             log(f"[RENEW] click failed({label}): {e}")
             return False
 
+    def _is_renew_action_label(self, text: str) -> bool:
+        """判断按钮文案是否真的是续期动作，排除 Renewals/My renewals 等导航 Tab。
+        2026-11 实测：'Renewals 0' Tab 的文案以 Renew 开头，旧逻辑把它当续期按钮，
+        点击后只切 Tab（并触发 ?view=renewals 503），永远等不到 Anti-bot 弹窗。"""
+        t = re.sub(r"\s+", " ", (text or "")).strip().lower()
+        if not t:
+            return False
+        if t in ("renewals", "renewal", "my renewals", "my renewal", "my renews", "mes renouvellements"):
+            return False
+        if t.startswith("my renew") or t.startswith("mes renouvel"):
+            return False
+        # Renewals 0 / Renewal (2) / Renewal will be available ... 都是 Tab 或提示
+        if t.startswith("renewal"):
+            return False
+        if t.startswith("renew") or t.startswith("extend") or t.startswith("prolong"):
+            return True
+        return t.startswith("renouvel") and not t.startswith("renouvellement")
+
     async def _find_visible_renew_buttons(self):
-        """只返回可见的 Renew/Extend 类按钮，避免点到隐藏模板（根因修复）。
-        旧代码用 *:has-text(server_id) 会命中隐藏的 client-btn，导致
-        'element is not visible' 超时 30s x3。
-        注意：必须排除 'My renewals' Tab（它包含 Renew 子串但不是续期按钮）。"""
+        """只返回可见且文案确实是续期动作的按钮（排除 Tab / 侧边栏 / 隐藏模板）。"""
         candidates = self.page.locator(
             'button:has-text("Renew"), button:has-text("Renouveler"), '
             'button:has-text("Extend"), button:has-text("Prolonger"), '
-            'button:has-text("Renewal"), a:has-text("Renew")'
+            'a:has-text("Renew"), a:has-text("Renouveler")'
         )
         visible = []
         try:
             count = await candidates.count()
         except Exception:
             return visible
-        for i in range(min(count, 30)):
+        for i in range(min(count, 50)):
             try:
                 b = candidates.nth(i)
                 if await b.count() == 0:
                     continue
-                if await b.is_visible():
-                    try:
-                        t = (await b.inner_text()).strip()
-                    except Exception:
-                        t = ""
-                    tl = re.sub(r"\s+", " ", t).strip().lower()
-                    # 排除导航 Tab：My renewals / My renewal / Mes renouvellements 等
-                    if tl in ("my renewals", "my renewal", "mes renouvellements", "my renews"):
+                if not await b.is_visible():
+                    continue
+                try:
+                    t = (await b.inner_text()).strip()
+                except Exception:
+                    t = ""
+                if not self._is_renew_action_label(t):
+                    continue
+                try:
+                    role = (await b.get_attribute("role") or "").lower()
+                    if role == "tab" or await b.get_attribute("aria-selected") is not None:
                         continue
-                    if tl.startswith("my renew"):
+                    if await b.evaluate(
+                        "el => !!el.closest('[role=tablist],[role=tab],nav,aside,header')"
+                    ):
                         continue
-                    visible.append((b, t))
+                except Exception:
+                    pass
+                visible.append((b, t))
             except Exception:
                 continue
+        # 优先精确的 Renew / Renew now / Extend，避免误点带修饰文案
+        exact = {"renew", "renew now", "extend", "renouveler", "prolonger"}
+        visible.sort(key=lambda item: (item[1].strip().lower() not in exact, len(item[1])))
         return visible
 
     async def _open_my_renewals_detail(self, server_id: str) -> bool:
@@ -1322,6 +1394,7 @@ class ACLCloudsRenewer:
             "message": "",
         }
         name = f"renew_{server_id}_{int(time.time())}"
+        self._renew_api_status = None
 
         try:
             await self.page.goto(f"{BASE_URL}/dashboard/projects", wait_until="domcontentloaded", timeout=60000)
@@ -1469,6 +1542,11 @@ class ACLCloudsRenewer:
             if not turnstile_ok:
                 log("[RENEW] Turnstile not resolved, checking result anyway...")
             await save_screenshot(name, self.page)
+
+            if self._renew_api_status and 200 <= self._renew_api_status < 300:
+                log(f"[RENEW] Renewal API returned HTTP {self._renew_api_status}")
+                result["success"] = True
+                result["message"] = f"Renewal successful (API {self._renew_api_status})"
 
             if await self.page.locator("text=Server renewed successfully").count() > 0:
                 log("[RENEW] Server renewed successfully text found")
